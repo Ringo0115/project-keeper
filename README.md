@@ -5,7 +5,7 @@
 给一个本地项目配一个「长期在岗」的 AI 管家：跨会话记住项目的状态、决策和踩过的坑；
 任务开始前把记忆装进上下文，任务结束后在人工审批下更新记忆。
 
-当前进度：**M0 / M1 / M2 已完成；下一步 M3（任务队列）**。
+当前进度：**M0–M3 已完成；下一步 M4 最小压缩（随后 M5 可观测 / eval）**。
 
 ## 为什么做
 
@@ -18,6 +18,7 @@ keeper 把这些内容写成可读、可 diff、可手改的 Markdown，并且�
 - **工具循环**：读文件、列目录、搜索、写文件、受限 shell。
 - **人审边界**：写入 / 执行展示 diff 或命令，终端确认；拒绝后不执行。
 - **会话续跑**：JSONL 只追加，`--resume` 继续上次会话。
+- **持久任务队列**：`.agent/tasks.json`；跨进程中断恢复；完成 / 阻塞必须显式标记。
 - **CLI + OpenAI 兼容模型**：默认 DeepSeek，可通过配置切换。
 
 ## 快速开始
@@ -51,6 +52,7 @@ python -m keeper "看看项目里有哪些文件"
 | `write_file` | 需确认 | 新建或覆盖，覆盖时展示 diff |
 | `update_memory` | 需确认 | 更新 `.agent/memory/` 的决策 / 教训 / 状态；展示 diff，INDEX 自动生成 |
 | `shell` | 需确认 | argv 数组、命令白名单、固定 cwd、超时和输出截断 |
+| `complete_task` / `block_task` | 自动放行（仅任务模式） | 显式完成 / 阻塞当前任务；block 原因必填 |
 
 审批规则：只读放行；写入 / 执行询问 `[y/N]`；删除 / 高危直接拒绝；
 无审批器、异常、EOF、超时都拒绝（fail-closed）。
@@ -79,23 +81,28 @@ python -m keeper "看看项目里有哪些文件"
 ```bash
 keeper "看看项目里有哪些文件"       # 单任务
 keeper                               # 交互模式
-keeper --resume                      # 续跑最近一次会话
+keeper --resume                      # 有 queued 任务先跑任务；否则续跑最近会话
 keeper --session .agent/sessions/xxx.jsonl
 keeper --root ../other-project "..." # 指定项目根目录
+
+keeper task add "修复 login 测试"     # 入队，stdout 输出 task id
+keeper task list                     # 查看队列；会先做一次启动恢复
+keeper task run                      # 跑队首 queued 任务（一次一个 attempt）
+keeper task run t-20261122-153012-a1b2c3
 ```
 
 ## 数据落在哪
 
 目标项目的 `.agent/`：会话 JSONL 只追加；记忆在 `.agent/memory/`；
-任务队列（M3）将写入 `.agent/tasks.json`。
+任务队列在 `.agent/tasks.json`（原子写）。
 
 ## 路线
 
 - **M0 骨架**：已完成。
 - **M1 工具与审批**：已完成。
 - **M2 记忆**：已完成。
-- **M3 任务队列**：下一步；持久任务、中断恢复、显式完成 / 阻塞。
-- **M4 最小压缩**：token 阈值 + 六段摘要。
+- **M3 任务队列**：已完成；持久任务、中断恢复、显式完成 / 阻塞。
+- **M4 最小压缩**：下一步；token 阈值 + 六段摘要。
 - **M5 可观测 / eval**：本地 trace + 固定样本。
 
 不做：Web UI、多 agent、触发器、Skills、OS 沙箱、RAG / 向量库。

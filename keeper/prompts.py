@@ -1,13 +1,38 @@
-"""system prompt。静态说明在前，项目记忆拼在最后。"""
+"""system prompt。静态说明在前，项目记忆拼在最后，任务块再拼在记忆之后。"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from keeper.memory import render_memory
 
 
-def system_prompt(root: Path) -> str:
+@dataclass(frozen=True)
+class TaskContext:
+    """本次 attempt 的任务上下文；只在任务模式下注入。"""
+
+    id: str
+    title: str
+    attempt_number: int
+    session_id: str
+
+
+def _task_block(task: TaskContext) -> str:
+    return f"""# 当前任务（M3 任务队列）
+
+本节规则优先于上面的通用规则；冲突时以本节为准。
+
+- id: {task.id}
+- title: {task.title}
+- 这是第 {task.attempt_number} 次 attempt；session={task.session_id}。
+- 完成流程：任务真正完成后，先调用 complete_task，再给出简短回答；
+  只输出文本说“做完了”不算完成。
+- 无法完成时调用 block_task，reason 必须写清具体原因；空原因会被拒绝。
+- 完成或阻塞后直接给出简短回答，不要再调用其他工具。"""
+
+
+def system_prompt(root: Path, task: TaskContext | None = None) -> str:
     base = f"""你是 keeper，一个在本地项目里干活的 CLI agent。
 
 项目根目录：{root}
@@ -38,7 +63,14 @@ def system_prompt(root: Path) -> str:
 回答用简体中文，除非任务本身要求其他语言。"""
 
     # 记忆块必须留在最后：PROJECT_STATE 是注入顺序的最后一项。
+    # 任务块只在任务模式下追加在记忆之后；默认 None 时字节不变。
     memory = render_memory(root)
+    if task is None:
+        if memory:
+            return base.rstrip() + "\n\n" + memory
+        return base
+
+    prompt = base.rstrip()
     if memory:
-        return base.rstrip() + "\n\n" + memory
-    return base
+        prompt += "\n\n" + memory
+    return prompt.rstrip() + "\n\n" + _task_block(task)

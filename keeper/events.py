@@ -102,3 +102,14 @@ class Stop(Event):
 class ErrorEvent(Event):
     type: ClassVar[str] = "error"
     message: str = ""
+
+
+@dataclass
+class TaskEvent(Event):
+    """任务队列状态变化：入队、开始 attempt、完成、阻塞、恢复。"""
+
+    type: ClassVar[str] = "task"
+    action: str = ""
+    task_id: str = ""
+    status: str = ""
+    detail: str = ""

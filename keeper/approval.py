@@ -68,6 +68,11 @@ def review(
     """执行前的静态判断。不碰 stdin，不执行工具。"""
     summary = _summary(tool_name, args)
 
+    if tool_name in {"complete_task", "block_task"}:
+        # 任务簿记：只做终态转换、不写文件内容，也不需要人审。
+        # danger="task" 是语义标记；若走到下面的通用映射，未知 danger 仍会 DENY。
+        return Review(decision=Decision.ALLOW, summary=summary)
+
     if tool_name == "update_memory":
         # 预览与执行共用同一份纯规划；非法参数直接拒绝，不弹审批。
         try:
@@ -165,6 +170,13 @@ def _short_flag_has(item: str, flag: str) -> bool:
 
 
 def _summary(tool_name: str, args: dict[str, Any]) -> str:
+    if tool_name == "complete_task":
+        return "complete_task"
+    if tool_name == "block_task":
+        reason = args.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return f"block_task: {reason.strip()}"
+        return "block_task"
     if tool_name == "update_memory":
         file = args.get("file") or "?"
         action = args.get("action") or "?"

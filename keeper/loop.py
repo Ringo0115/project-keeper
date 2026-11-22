@@ -21,7 +21,7 @@ from keeper.events import (
     ToolResultEvent,
     UserMessage,
 )
-from keeper.prompts import system_prompt
+from keeper.prompts import TaskContext, system_prompt
 from keeper.session import Session
 from keeper.tools.base import ToolResult, error
 from keeper.tools.registry import Registry
@@ -45,11 +45,12 @@ class AgentLoop:
         root: Path,
         max_steps: int = 30,
         approver: Approver | None = None,
+        task: TaskContext | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.session = session
-        self.system = system_prompt(root)
+        self.system = system_prompt(root, task)
         self.max_steps = max_steps
         self.root = Path(root).resolve()
         self.approver = approver
