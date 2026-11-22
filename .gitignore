@@ -1,5 +1,6 @@
 .agent/
 .env
+README.local
 __pycache__/
 *.pyc
 .pytest_cache/
