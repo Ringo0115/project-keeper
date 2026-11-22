@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 from keeper.events import ApprovalRequest
+from keeper.memory import MemoryOpError, format_plan, plan_update
 from keeper.tools.fs import resolve_path
 
 DEFAULT_TIMEOUT = 60.0
@@ -66,6 +67,28 @@ def review(
 ) -> Review:
     """执行前的静态判断。不碰 stdin，不执行工具。"""
     summary = _summary(tool_name, args)
+
+    if tool_name == "update_memory":
+        # 预览与执行共用同一份纯规划；非法参数直接拒绝，不弹审批。
+        try:
+            plan = plan_update(root, args)
+        except MemoryOpError as exc:
+            return Review(
+                decision=Decision.DENY,
+                reason=f"invalid memory update: {exc}",
+                summary=summary,
+            )
+        except Exception as exc:  # fail-closed：预览失败也不放行
+            return Review(
+                decision=Decision.DENY,
+                reason=f"memory preview failed: {type(exc).__name__}: {exc}",
+                summary=summary,
+            )
+        return Review(
+            decision=Decision.ASK,
+            summary=summary,
+            detail=format_plan(plan),
+        )
 
     if tool_name == "shell":
         detail = _shell_detail(args)
@@ -142,6 +165,10 @@ def _short_flag_has(item: str, flag: str) -> bool:
 
 
 def _summary(tool_name: str, args: dict[str, Any]) -> str:
+    if tool_name == "update_memory":
+        file = args.get("file") or "?"
+        action = args.get("action") or "?"
+        return f"update_memory: {file}/{action}"
     path = args.get("path")
     if tool_name == "shell":
         argv = args.get("argv")

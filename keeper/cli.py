@@ -29,6 +29,7 @@ from keeper.llm import LLMClient
 from keeper.loop import AgentLoop
 from keeper.session import Session
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
+from keeper.tools.memory import UpdateMemoryTool
 from keeper.tools.registry import Registry
 from keeper.tools.shell import ShellTool
 
@@ -130,7 +131,7 @@ def _repl(loop: AgentLoop, session: Session) -> int:
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
 
-    parser = argparse.ArgumentParser(prog="keeper", description="项目级持久化 Agent（M1）")
+    parser = argparse.ArgumentParser(prog="keeper", description="项目级持久化 Agent（M2）")
     parser.add_argument("task", nargs="*", help="要执行的任务；省略则进入交互模式")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录")
     parser.add_argument("--resume", action="store_true", help="续跑这个项目最近一次会话")
@@ -180,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             ListDirTool(root),
             WriteFileTool(root),
             SearchTool(root),
+            UpdateMemoryTool(root),
             ShellTool(root),
         ]
     )
