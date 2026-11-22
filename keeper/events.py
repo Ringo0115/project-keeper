@@ -1,0 +1,84 @@
+"""内核产出的事件。loop 只 yield 事件，渲染交给调用方。"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, ClassVar
+
+
+@dataclass
+class Event:
+    type: ClassVar[str] = "event"
+    ts: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data.pop("ts", None)
+        return {"type": self.type, "ts": self.ts, **data}
+
+
+@dataclass
+class SessionStart(Event):
+    type: ClassVar[str] = "session_start"
+    session_id: str = ""
+    path: str = ""
+    resumed: bool = False
+    model: str = ""
+
+
+@dataclass
+class UserMessage(Event):
+    type: ClassVar[str] = "user_message"
+    text: str = ""
+
+
+@dataclass
+class StepStart(Event):
+    type: ClassVar[str] = "step_start"
+    step: int = 0
+
+
+@dataclass
+class AssistantText(Event):
+    """中间轮次的 assistant 文本（后面还跟着工具调用）。"""
+
+    type: ClassVar[str] = "assistant_text"
+    text: str = ""
+
+
+@dataclass
+class ToolCallEvent(Event):
+    type: ClassVar[str] = "tool_call"
+    call_id: str = ""
+    name: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    valid_json: bool = True
+
+
+@dataclass
+class ToolResultEvent(Event):
+    type: ClassVar[str] = "tool_result"
+    call_id: str = ""
+    name: str = ""
+    ok: bool = False
+    output: str = ""
+    duration_ms: int = 0
+
+
+@dataclass
+class FinalAnswer(Event):
+    type: ClassVar[str] = "final_answer"
+    text: str = ""
+
+
+@dataclass
+class Stop(Event):
+    type: ClassVar[str] = "stop"
+    reason: str = ""
+
+
+@dataclass
+class ErrorEvent(Event):
+    type: ClassVar[str] = "error"
+    message: str = ""

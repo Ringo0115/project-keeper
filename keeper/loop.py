@@ -1,0 +1,129 @@
+"""Agent 主循环：组装上下文 → 调模型 → 执行工具 → 回灌 → 停机判断。"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any, Iterator, Protocol
+
+from keeper.events import (
+    AssistantText,
+    ErrorEvent,
+    Event,
+    FinalAnswer,
+    StepStart,
+    Stop,
+    ToolCallEvent,
+    ToolResultEvent,
+    UserMessage,
+)
+from keeper.prompts import system_prompt
+from keeper.session import Session
+from keeper.tools.base import ToolResult
+from keeper.tools.registry import Registry
+
+
+class ChatLLM(Protocol):
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Any: ...
+
+
+class AgentLoop:
+    def __init__(
+        self,
+        *,
+        llm: ChatLLM,
+        registry: Registry,
+        session: Session,
+        root: Path,
+        max_steps: int = 30,
+    ) -> None:
+        self.llm = llm
+        self.registry = registry
+        self.session = session
+        self.system = system_prompt(root)
+        self.max_steps = max_steps
+
+    def _messages(self) -> list[dict[str, Any]]:
+        return [{"role": "system", "content": self.system}, *self.session.messages]
+
+    def run(self, user_text: str) -> Iterator[Event]:
+        self.session.append({"role": "user", "content": user_text})
+        yield UserMessage(text=user_text)
+
+        for step in range(1, self.max_steps + 1):
+            yield StepStart(step=step)
+
+            try:
+                response = self.llm.chat(
+                    self._messages(),
+                    tools=self.registry.schemas(),
+                )
+            except Exception as exc:
+                yield ErrorEvent(message=f"LLM call failed: {exc}")
+                yield Stop(reason="llm_error")
+                return
+
+            message = response.message
+            self.session.append(message)
+            text = message.get("content") or ""
+            tool_calls = message.get("tool_calls") or []
+
+            if not tool_calls:
+                yield FinalAnswer(text=text)
+                return
+
+            if text.strip():
+                yield AssistantText(text=text)
+
+            for call in tool_calls:
+                yield from self._run_tool_call(call)
+
+        self.session.note(f"stopped: max_steps ({self.max_steps})")
+        yield Stop(reason="max_steps")
+
+    def _run_tool_call(self, call: dict[str, Any]) -> Iterator[Event]:
+        call_id = call.get("id") or ""
+        function = call.get("function") or {}
+        name = function.get("name") or ""
+        raw_args = function.get("arguments") or "{}"
+        duration_ms = 0
+
+        try:
+            parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            if not isinstance(parsed, dict):
+                raise ValueError("arguments must be a JSON object")
+            args = parsed
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            yield ToolCallEvent(
+                call_id=call_id,
+                name=name,
+                args={},
+                valid_json=False,
+            )
+            result = ToolResult(ok=False, content=f"ERROR: invalid tool arguments: {exc}")
+        else:
+            yield ToolCallEvent(
+                call_id=call_id,
+                name=name,
+                args=args,
+                valid_json=True,
+            )
+            started = time.perf_counter()
+            result = self.registry.dispatch(name, args)
+            duration_ms = int((time.perf_counter() - started) * 1000)
+
+        self.session.append(
+            {"role": "tool", "tool_call_id": call_id, "content": result.content}
+        )
+        yield ToolResultEvent(
+            call_id=call_id,
+            name=name,
+            ok=result.ok,
+            output=result.content,
+            duration_ms=duration_ms,
+        )
