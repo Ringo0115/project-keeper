@@ -19,6 +19,9 @@ class Registry:
     def names(self) -> list[str]:
         return list(self._tools)
 
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
     def dispatch(self, name: str, args: dict[str, Any]) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:

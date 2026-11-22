@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Generator, Iterator, Protocol
 
+from keeper.approval import Approver, Decision, review
 from keeper.events import (
+    ApprovalRequest,
+    ApprovalResult,
     AssistantText,
     ErrorEvent,
     Event,
@@ -20,7 +23,7 @@ from keeper.events import (
 )
 from keeper.prompts import system_prompt
 from keeper.session import Session
-from keeper.tools.base import ToolResult
+from keeper.tools.base import ToolResult, error
 from keeper.tools.registry import Registry
 
 
@@ -41,12 +44,15 @@ class AgentLoop:
         session: Session,
         root: Path,
         max_steps: int = 30,
+        approver: Approver | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.session = session
         self.system = system_prompt(root)
         self.max_steps = max_steps
+        self.root = Path(root).resolve()
+        self.approver = approver
 
     def _messages(self) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.system}, *self.session.messages]
@@ -91,7 +97,6 @@ class AgentLoop:
         function = call.get("function") or {}
         name = function.get("name") or ""
         raw_args = function.get("arguments") or "{}"
-        duration_ms = 0
 
         try:
             parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -106,6 +111,7 @@ class AgentLoop:
                 valid_json=False,
             )
             result = ToolResult(ok=False, content=f"ERROR: invalid tool arguments: {exc}")
+            duration_ms = 0
         else:
             yield ToolCallEvent(
                 call_id=call_id,
@@ -113,9 +119,9 @@ class AgentLoop:
                 args=args,
                 valid_json=True,
             )
-            started = time.perf_counter()
-            result = self.registry.dispatch(name, args)
-            duration_ms = int((time.perf_counter() - started) * 1000)
+            result, duration_ms = yield from self._gate_and_execute(
+                call_id, name, args
+            )
 
         self.session.append(
             {"role": "tool", "tool_call_id": call_id, "content": result.content}
@@ -127,3 +133,67 @@ class AgentLoop:
             output=result.content,
             duration_ms=duration_ms,
         )
+
+    def _gate_and_execute(
+        self, call_id: str, name: str, args: dict[str, Any]
+    ) -> Generator[Event, None, tuple[ToolResult, int]]:
+        """审批门 + 执行。返回 (结果, 执行耗时)；耗时不含等待审批的时间。"""
+        tool = self.registry.get(name)
+        if tool is not None:
+            verdict = review(
+                tool_name=name,
+                danger=tool.danger,
+                args=args,
+                root=self.root,
+            )
+
+            if verdict.decision is Decision.DENY:
+                reason = verdict.reason or "not permitted by policy"
+                yield ApprovalResult(
+                    call_id=call_id,
+                    tool=name,
+                    approved=False,
+                    reason=reason,
+                )
+                return (
+                    error(f"denied: {reason}. The operation was not executed."),
+                    0,
+                )
+
+            if verdict.decision is Decision.ASK:
+                request = ApprovalRequest(
+                    call_id=call_id,
+                    tool=name,
+                    summary=verdict.summary,
+                    detail=verdict.detail,
+                )
+                yield request
+                approved, reason = self._confirm(request)
+                yield ApprovalResult(
+                    call_id=call_id,
+                    tool=name,
+                    approved=approved,
+                    reason=reason,
+                )
+                if not approved:
+                    return (
+                        error(
+                            f"denied: {reason}. The operation was not executed; "
+                            "adjust your approach."
+                        ),
+                        0,
+                    )
+
+        started = time.perf_counter()
+        result = self.registry.dispatch(name, args)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        return result, duration_ms
+
+    def _confirm(self, request: ApprovalRequest) -> tuple[bool, str]:
+        if self.approver is None:
+            return False, "no approver configured (fail-closed)"
+        try:
+            approved = bool(self.approver.confirm(request))
+        except Exception as exc:  # 审批器出问题也必须拒绝
+            return False, f"approval failed: {type(exc).__name__}: {exc}"
+        return approved, "approved by user" if approved else "denied by user"

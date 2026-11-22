@@ -67,6 +67,26 @@ class ToolResultEvent(Event):
 
 
 @dataclass
+class ApprovalRequest(Event):
+    """执行写入/命令前，等待用户确认。"""
+
+    type: ClassVar[str] = "approval_request"
+    call_id: str = ""
+    tool: str = ""
+    summary: str = ""
+    detail: str = ""
+
+
+@dataclass
+class ApprovalResult(Event):
+    type: ClassVar[str] = "approval_result"
+    call_id: str = ""
+    tool: str = ""
+    approved: bool = False
+    reason: str = ""
+
+
+@dataclass
 class FinalAnswer(Event):
     type: ClassVar[str] = "final_answer"
     text: str = ""

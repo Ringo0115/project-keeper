@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Iterable
 
 from keeper import __version__
+from keeper.approval import StdioApprover
 from keeper.config import load_config
 from keeper.events import (
+    ApprovalRequest,
+    ApprovalResult,
     AssistantText,
     ErrorEvent,
     Event,
@@ -25,8 +28,9 @@ from keeper.events import (
 from keeper.llm import LLMClient
 from keeper.loop import AgentLoop
 from keeper.session import Session
-from keeper.tools.fs import ReadFileTool
+from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
 from keeper.tools.registry import Registry
+from keeper.tools.shell import ShellTool
 
 
 def _setup_console() -> None:
@@ -57,6 +61,14 @@ def render(events: Iterable[Event]) -> None:
             mark = "ok" if event.ok else "ERR"
             first = event.output.splitlines()[0] if event.output else ""
             print(f"  <- {mark} {_short(first, 110)} ({event.duration_ms}ms)", file=sys.stderr)
+        elif isinstance(event, ApprovalRequest):
+            print(f"\n[approval] {event.summary}", file=sys.stderr)
+            for line in event.detail.splitlines():
+                print(f"    {line}", file=sys.stderr)
+        elif isinstance(event, ApprovalResult):
+            state = "approved" if event.approved else "denied"
+            reason = f" ({event.reason})" if event.reason else ""
+            print(f"[approval] {state}{reason}", file=sys.stderr)
         elif isinstance(event, AssistantText):
             if event.text.strip():
                 print(event.text)
@@ -118,7 +130,7 @@ def _repl(loop: AgentLoop, session: Session) -> int:
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
 
-    parser = argparse.ArgumentParser(prog="keeper", description="项目级持久化 Agent（M0）")
+    parser = argparse.ArgumentParser(prog="keeper", description="项目级持久化 Agent（M1）")
     parser.add_argument("task", nargs="*", help="要执行的任务；省略则进入交互模式")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录")
     parser.add_argument("--resume", action="store_true", help="续跑这个项目最近一次会话")
@@ -162,13 +174,23 @@ def main(argv: list[str] | None = None) -> int:
         model=config.model,
         temperature=config.temperature,
     )
-    registry = Registry([ReadFileTool(root)])
+    registry = Registry(
+        [
+            ReadFileTool(root),
+            ListDirTool(root),
+            WriteFileTool(root),
+            SearchTool(root),
+            ShellTool(root),
+        ]
+    )
+    approver = StdioApprover(timeout=config.approval_timeout)
     loop = AgentLoop(
         llm=llm,
         registry=registry,
         session=session,
         root=root,
         max_steps=config.max_steps,
+        approver=approver,
     )
     start = SessionStart(
         session_id=session.session_id,
