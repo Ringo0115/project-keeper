@@ -1,6 +1,8 @@
 .agent/
 .env
 README.local
+docs/
+CLAUDE.md
 __pycache__/
 *.pyc
 .pytest_cache/
