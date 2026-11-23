@@ -19,6 +19,8 @@ class LLMError(RuntimeError):
 class LLMResponse:
     message: dict[str, Any]
     usage: dict[str, Any] = field(default_factory=dict)
+    # OpenAI 兼容接口的 finish_reason；"length" 表示输出被截断。
+    finish_reason: str | None = None
 
 
 class LLMClient:
@@ -87,12 +89,17 @@ class LLMClient:
     def _parse(response: httpx.Response) -> LLMResponse:
         try:
             data = response.json()
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"unexpected response: {response.text[:500]}") from exc
+        finish_reason = (
+            choice.get("finish_reason") if isinstance(choice, dict) else None
+        )
         return LLMResponse(
             message=_normalize_message(message),
             usage=data.get("usage") or {},
+            finish_reason=finish_reason if isinstance(finish_reason, str) else None,
         )
 
 

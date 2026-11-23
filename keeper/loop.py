@@ -9,9 +9,10 @@ from typing import Any, Generator, Iterator, Protocol
 
 from keeper.approval import Approver, Decision, review
 from keeper.compaction import (
-    SummaryError,
+    estimate_request_tokens,
     estimate_tokens,
-    find_cut_index,
+    find_cut_point,
+    merge_split_summary,
     summarize,
 )
 from keeper.config import (
@@ -40,8 +41,24 @@ from keeper.session import SUMMARY_PREFIX, Session
 from keeper.tools.base import ToolResult, error
 from keeper.tools.registry import Registry
 
-# 摘要失败后，上下文至少再增长这么多 tokens 才重试，避免每个 step 重复付费。
-COMPACTION_RETRY_MARGIN_TOKENS = 4096
+
+def _is_summary_message(message: dict[str, Any]) -> bool:
+    """压缩后写入的第一条消息；它不是新内容。"""
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and isinstance(content, str)
+        and content.startswith(SUMMARY_PREFIX)
+    )
+
+
+def _summary_body(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, str):
+        return ""
+    if content.startswith(SUMMARY_PREFIX):
+        return content[len(SUMMARY_PREFIX):]
+    return content
 
 
 class ChatLLM(Protocol):
@@ -78,116 +95,155 @@ class AgentLoop:
         self.context_window = context_window
         self.reserve_tokens = reserve_tokens
         self.keep_tokens = keep_tokens
-        # 上一次正常 chat 的 prompt token 数；None 表示还没有可判断的响应。
-        self._last_prompt_tokens: int | None = None
-        # 摘要失败时的上下文大小；上下文没明显增长前不重试。
-        self._compaction_failed_at: int | None = None
+        # 最近一次有效响应的整次调用 token 数（含输出），以及它对应的
+        # assistant 消息下标；其后追加的消息用估算补齐。
+        self._usage_tokens: int | None = None
+        self._usage_index: int | None = None
 
     def _messages(self) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.system}, *self.session.messages]
 
     def _should_compact(self) -> bool:
-        # usage 只覆盖上一次请求；之后的 assistant / tool 消息还没算进去。
-        # 当前上下文估算兜住「工具输出把窗口推过阈值」的情况，
-        # 也让 resume 时已经过大的会话在第一次请求前就能压缩。
-        current = self._context_tokens()
-        if (
-            self._compaction_failed_at is not None
-            and current
-            < self._compaction_failed_at + COMPACTION_RETRY_MARGIN_TOKENS
-        ):
-            return False
-        observed = self._last_prompt_tokens or 0
-        threshold = self.context_window - self.reserve_tokens
-        return max(observed, current) > threshold
+        # 口径移植自 pi-agent 的 estimateContextTokens：最近一次有效 usage
+        # 加上其后的消息估算；没有 usage 时退到全量估算（含工具 schema）。
+        return self._context_tokens() > self.context_window - self.reserve_tokens
 
     def _context_tokens(self) -> int:
-        return estimate_tokens(self._messages())
+        if self._usage_tokens is not None and self._usage_index is not None:
+            if 0 <= self._usage_index < len(self.session.messages):
+                trailing = self.session.messages[self._usage_index + 1 :]
+                return self._usage_tokens + estimate_tokens(trailing)
+        return estimate_request_tokens(
+            self._messages(), self.registry.schemas()
+        )
 
-    def _record_usage(self, response: Any, request_estimate: int) -> None:
-        """记录下一次判断要用的 prompt tokens；usage 缺失时用估算兜底。"""
+    @staticmethod
+    def _usage_int(usage: dict[str, Any], key: str) -> int | None:
+        try:
+            value = int(usage.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def _record_usage(self, response: Any) -> None:
+        """记录最近一次有效 usage；优先 total_tokens，否则 prompt + completion。"""
         usage = getattr(response, "usage", None)
-        if isinstance(usage, dict):
-            try:
-                prompt_tokens = int(usage.get("prompt_tokens"))
-            except (TypeError, ValueError):
-                prompt_tokens = None
-            if prompt_tokens is not None and prompt_tokens >= 0:
-                self._last_prompt_tokens = prompt_tokens
-                return
-        self._last_prompt_tokens = request_estimate
+        if not isinstance(usage, dict):
+            return
+
+        tokens = self._usage_int(usage, "total_tokens")
+        if not tokens:
+            prompt = self._usage_int(usage, "prompt_tokens")
+            if prompt is not None:
+                completion = self._usage_int(usage, "completion_tokens") or 0
+                total = prompt + completion
+                tokens = total if total > 0 else None
+        if not tokens:
+            return
+
+        self._usage_tokens = tokens
+        self._usage_index = len(self.session.messages) - 1
 
     def _compact(self) -> Iterator[Event]:
-        """压缩一次；失败只发事件和 note，不让任务中断。"""
+        """压缩一次；摘要不可用时降级为确定性摘要，不让任务中断。"""
         threshold = self.context_window - self.reserve_tokens
         messages = self.session.messages
-        cut_index = find_cut_index(
+        point = find_cut_point(
             messages,
             self.keep_tokens,
             estimate_tokens,
             max_tail_tokens=threshold,
         )
-        tokens_before = self._last_prompt_tokens or self._context_tokens()
+        cut_index = point.cut_index
 
         if cut_index <= 0:
-            # 没有可丢弃的前缀：重置判断值，避免每个 step 重复检查。
-            self._last_prompt_tokens = self._context_tokens()
-            self._compaction_failed_at = None
             return
 
+        prefix = messages[:cut_index]
+        if prefix and all(_is_summary_message(message) for message in prefix):
+            # 前缀只剩旧摘要：没有新内容可总结，避免每个 step 重复摘要。
+            return
+
+        tokens_before = self._context_tokens()
+        messages_before = len(messages)
         yield CompactionStart(
             tokens_before=tokens_before,
             cut_index=cut_index,
             reason="threshold",
         )
 
-        messages_before = len(messages)
         try:
-            summary = summarize(
-                self.llm,
-                messages[:cut_index],
-                max_input_tokens=max(1, threshold),
-            )
+            if point.is_split_turn:
+                history = messages[: point.turn_start_index]
+                turn_prefix = messages[point.turn_start_index : cut_index]
+                if history and all(
+                    _is_summary_message(message) for message in history
+                ):
+                    # 历史部分只有旧摘要：直接沿用，不用再付一次摘要调用。
+                    history_text = _summary_body(history[-1]) or "（没有更早的历史记录）"
+                    history_degraded = False
+                else:
+                    history_result = summarize(
+                        self.llm, history, max_input_tokens=max(1, threshold)
+                    )
+                    history_text = history_result.text
+                    history_degraded = history_result.degraded
+                turn_result = summarize(
+                    self.llm,
+                    turn_prefix,
+                    max_input_tokens=max(1, threshold),
+                    kind="turn_prefix",
+                )
+                summary = merge_split_summary(history_text, turn_result.text)
+                degraded = history_degraded or turn_result.degraded
+            else:
+                result = summarize(
+                    self.llm, prefix, max_input_tokens=max(1, threshold)
+                )
+                summary = result.text
+                degraded = result.degraded
+
             projected = [
                 {"role": "system", "content": self.system},
                 {"role": "user", "content": SUMMARY_PREFIX + summary},
                 *messages[cut_index:],
             ]
-            tokens_after = estimate_tokens(projected)
+            tokens_after = estimate_request_tokens(
+                projected, self.registry.schemas()
+            )
             self.session.compact(
                 summary,
                 cut_index,
                 tokens_before=tokens_before,
                 tokens_after=tokens_after,
+                degraded=degraded,
             )
         except Exception as exc:
-            reason = "invalid_summary" if isinstance(exc, SummaryError) else "summary_error"
             self.session.note(f"compaction failed: {type(exc).__name__}: {exc}")
-            tokens_after = self._context_tokens()
-            self._compaction_failed_at = tokens_after
             yield CompactionFailed(
                 tokens_before=tokens_before,
-                tokens_after=tokens_after,
+                tokens_after=self._context_tokens(),
                 cut_index=cut_index,
-                reason=reason,
+                reason="summary_error",
                 error=str(exc),
             )
             return
 
-        # 用估算值重置，避免下一步立刻按旧 usage 重复触发。
-        self._last_prompt_tokens = tokens_after
-        self._compaction_failed_at = None
+        # 压缩后旧 usage 只反映压缩前的上下文，作废；下次走纯估算。
+        self._usage_tokens = None
+        self._usage_index = None
+        if degraded:
+            self.session.note("compaction degraded: deterministic digest used")
         yield CompactionDone(
             tokens_before=tokens_before,
             tokens_after=tokens_after,
             cut_index=cut_index,
             messages_before=messages_before,
             messages_after=len(self.session.messages),
+            degraded=degraded,
         )
 
     def run(self, user_text: str) -> Iterator[Event]:
-        # 新的一轮用户任务：允许摘要失败后重新尝试一次。
-        self._compaction_failed_at = None
         self.session.append({"role": "user", "content": user_text})
         yield UserMessage(text=user_text)
 
@@ -198,7 +254,6 @@ class AgentLoop:
                 yield from self._compact()
 
             request_messages = self._messages()
-            request_estimate = estimate_tokens(request_messages)
             try:
                 response = self.llm.chat(
                     request_messages,
@@ -211,7 +266,7 @@ class AgentLoop:
 
             message = response.message
             self.session.append(message)
-            self._record_usage(response, request_estimate)
+            self._record_usage(response)
             text = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
 

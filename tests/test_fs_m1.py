@@ -183,3 +183,35 @@ def test_search_requires_pattern(root: Path) -> None:
     result = SearchTool(root).execute({})
     assert not result.ok
     assert "pattern is required" in result.content
+
+# ---------- read_file 输出上限 ----------
+
+
+def test_read_file_caps_single_result_bytes(root: Path) -> None:
+    from keeper.tools.fs import MAX_OUTPUT_BYTES, ReadFileTool
+
+    (root / "big.txt").write_text(
+        "\n".join(f"line {index} " + "x" * 100 for index in range(1000)),
+        encoding="utf-8",
+    )
+    result = ReadFileTool(root).execute({"path": "big.txt", "max_lines": 1000})
+
+    assert result.ok
+    assert len(result.content.encode("utf-8")) <= MAX_OUTPUT_BYTES + 300
+    assert "truncated:" in result.content
+    assert "continue with start_line=" in result.content
+    assert "line 0 " in result.content
+    assert "line 999 " not in result.content
+
+
+def test_read_file_omits_line_longer_than_output_cap(root: Path) -> None:
+    from keeper.tools.fs import MAX_OUTPUT_BYTES, ReadFileTool
+
+    (root / "one_line.txt").write_text(
+        "x" * (MAX_OUTPUT_BYTES + 10), encoding="utf-8"
+    )
+    result = ReadFileTool(root).execute({"path": "one_line.txt"})
+
+    assert result.ok
+    assert "longer than" in result.content
+    assert "omitted" in result.content

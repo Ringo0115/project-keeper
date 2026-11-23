@@ -82,13 +82,14 @@ python -m keeper "看看项目里有哪些文件"
 
 ## 上下文压缩（M4）
 
-每个 step 调模型前检查 `max(上一次响应 usage, 当前上下文估算)`；超过 `KEEPER_CONTEXT_WINDOW - KEEPER_RESERVE_TOKENS` 时，摘要切点之前的前缀，保留最近约 `KEEPER_KEEP_TOKENS` tokens。
+每个 step 调模型前检查最近一次有效 usage（优先 `total_tokens`，否则 `prompt + completion`）加上其后消息的估算；没有 usage 时用全量估算（含工具 schema）。超过 `KEEPER_CONTEXT_WINDOW - KEEPER_RESERVE_TOKENS` 时，摘要切点之前的前缀，保留最近约 `KEEPER_KEEP_TOKENS` tokens。
 
-- 切点不拆开 assistant 的 `tool_calls` 和 `tool` 结果；单组输出自身超过预算时整段摘要。
+- 切点不拆开 assistant 的 `tool_calls` 和 `tool` 结果；切在轮次中间时，历史摘要和轮次前缀摘要分开生成再合并。保留区仍超过窗口预算时整段摘要；前缀只剩旧摘要时跳过，避免重复压缩。
+- 摘要输入把单条工具结果和工具调用参数头截断到 2000 字符；整体仍超限时保留首条 + 最近消息。
 - 摘要固定六段：Goal / Constraints & Preferences / Progress / Key Decisions / Next Steps / Critical Context。
-- 校验六段非空，并检查输入里的文件路径和 `ERROR:` 原文是否原样保留。
-- 会话 JSONL 只追加 `compaction` 记录，旧消息不删；`--resume` 按顺序回放。
-- 摘要失败不中断任务；同一轮任务里不会每个 step 重复付费重试。
+- 校验六段非空；拒绝 tool_calls / JSON / 空文本，内容失败重试一次。路径和 `ERROR:` 原文缺失时确定性补齐；仍不可用时用确定性摘要兜底，记录 `degraded`。
+- 会话 JSONL 只追加 `compaction` 记录（含 `tokens_before` / `tokens_after`，降级时含 `degraded`），旧消息不删；`--resume` 按顺序回放。
+- 摘要不可用不中断任务，压缩照常完成；`read_file` 单次结果上限 50KB。
 
 ## 常用命令
 

@@ -11,6 +11,8 @@ from keeper.tools.base import Tool, ToolResult, error
 MAX_BYTES = 1_000_000
 DEFAULT_MAX_LINES = 200
 HARD_MAX_LINES = 1000
+# 单次 read_file 结果的字节上限（移植自 pi-agent 的 50KB 工具输出上限）。
+MAX_OUTPUT_BYTES = 50 * 1024
 
 IGNORED_DIRS = {".git", ".agent", "__pycache__"}
 PROTECTED_WRITE_DIRS = {".git", ".agent"}
@@ -50,6 +52,32 @@ def _as_int(value: Any, default: int) -> int:
 
 def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _cap_output_bytes(text: str, max_bytes: int, start: int) -> str:
+    """按完整行截断到字节上限，并给下一次读取的 start_line。
+
+    第一行（含表头）自己就超限时不返回半行，只给提示。
+    """
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    cut = raw[:max_bytes].rfind(b"\n")
+    kept = raw[: max(cut, 0)].decode("utf-8", "ignore")
+    # 内容 = 表头一行 + 正文若干行；正文行数等于保留部分里的换行数。
+    kept_lines = kept.count("\n")
+    if kept_lines == 0:
+        # 表头之后的第一行自己就超过上限：不返回半行，也不建议从同一行重读。
+        return (
+            f"[line {start} is longer than {max_bytes} bytes and was omitted; "
+            "use a narrower range with start_line/max_lines]"
+        )
+    omitted = len(raw) - len(kept.encode("utf-8"))
+    next_start = start + kept_lines
+    return (
+        f"{kept}\n[truncated: {omitted} more bytes; "
+        f"continue with start_line={next_start}]"
+    )
 
 
 class ReadFileTool(Tool):
@@ -132,7 +160,10 @@ class ReadFileTool(Tool):
                 f"\n[truncated: {total - end} more lines; "
                 f"continue with start_line={end + 1}]"
             )
-        return ToolResult(ok=True, content=f"{header}\n{numbered}")
+        content = _cap_output_bytes(
+            f"{header}\n{numbered}", MAX_OUTPUT_BYTES, start
+        )
+        return ToolResult(ok=True, content=content)
 
 
 class ListDirTool(Tool):

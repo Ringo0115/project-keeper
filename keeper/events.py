@@ -122,11 +122,13 @@ class CompactionDone(Event):
     cut_index: int = 0
     messages_before: int = 0
     messages_after: int = 0
+    # 摘要器不可用时用了确定性兜底；质量下降但压缩本身成功。
+    degraded: bool = False
 
 
 @dataclass
 class CompactionFailed(Event):
-    """摘要失败：不写 compaction、不中断任务。"""
+    """压缩本身失败（例如写盘异常）：不中断任务。"""
 
     type: ClassVar[str] = "compaction_failed"
     tokens_before: int = 0

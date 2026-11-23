@@ -119,10 +119,12 @@ class Session:
         *,
         tokens_before: int = 0,
         tokens_after: int | None = None,
+        degraded: bool = False,
     ) -> None:
         """追加一条 compaction 记录，并把内存消息换成「摘要 + 切点之后」。
 
         旧 message 记录原样留在 JSONL 里；加载时按顺序回放 compaction。
+        ``degraded`` 记录这次摘要是否由确定性兜底生成。
         """
         if type(cut_index) is not int or not 0 <= cut_index <= len(self.messages):
             raise ValueError(f"invalid cut_index: {cut_index!r}")
@@ -138,6 +140,8 @@ class Session:
         }
         if tokens_after is not None:
             record["tokens_after"] = tokens_after
+        if degraded:
+            record["degraded"] = True
         self._write(record)
         self.messages = [_summary_message(summary), *self.messages[cut_index:]]
 

@@ -15,7 +15,7 @@ from keeper.compaction import SUMMARY_SECTIONS
 from keeper.events import CompactionDone, CompactionFailed, CompactionStart, FinalAnswer
 from keeper.llm import LLMResponse
 from keeper.loop import AgentLoop
-from keeper.session import Session
+from keeper.session import SUMMARY_PREFIX, Session
 from keeper.tools.base import Tool, ToolResult
 from keeper.tools.fs import ReadFileTool
 from keeper.tools.registry import Registry
@@ -196,7 +196,8 @@ def test_usage_over_threshold_summarizes_then_uses_summary(tmp_path: Path) -> No
         starts = [event for event in events if isinstance(event, CompactionStart)]
         dones = [event for event in events if isinstance(event, CompactionDone)]
         assert len(starts) == 1 and len(dones) == 1
-        assert starts[0].tokens_before == 5_000
+        # pi 口径：usage（5000）+ 其后工具消息的估算。
+        assert starts[0].tokens_before >= 5_000
         assert starts[0].cut_index == 1
         assert dones[0].tokens_after < dones[0].tokens_before
 
@@ -273,7 +274,8 @@ def test_jsonl_keeps_old_messages_and_resume_matches(tmp_path: Path) -> None:
     assert compaction["summary"] == VALID_SUMMARY
     assert compaction["cut_index"] == 1
     assert compaction["messages_before"] == 3
-    assert compaction["tokens_before"] == 5_000
+    assert compaction["tokens_before"] == done.tokens_before
+    assert compaction["tokens_before"] >= 5_000
     assert compaction["tokens_after"] == done.tokens_after
     assert compaction["tokens_after"] > 0
 
@@ -373,14 +375,14 @@ def test_consecutive_compactions_use_effective_message_list(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("summary_error", "reason"),
+    "summary_error",
     [
-        (RuntimeError("summary backend down"), "summary_error"),
-        ("## Goal\n只有目标", "invalid_summary"),
+        RuntimeError("summary backend down"),
+        "## Goal\n只有目标",
     ],
 )
-def test_summary_failure_does_not_stop_the_run(
-    tmp_path: Path, summary_error, reason: str
+def test_summary_failure_degrades_instead_of_stopping(
+    tmp_path: Path, summary_error
 ) -> None:
     llm = FakeLLM(
         [
@@ -399,102 +401,48 @@ def test_summary_failure_does_not_stop_the_run(
     try:
         events = list(loop.run("read it"))
 
-        failures = [
-            event for event in events if isinstance(event, CompactionFailed)
-        ]
-        assert len(failures) == 1
-        assert failures[0].reason == reason
-        assert failures[0].cut_index == 1
+        dones = [event for event in events if isinstance(event, CompactionDone)]
+        assert len(dones) == 1
+        assert dones[0].degraded is True
+        assert not any(
+            isinstance(event, CompactionFailed) for event in events
+        )
         assert isinstance(events[-1], FinalAnswer)
         assert events[-1].text == "kept going"
 
         records = _records(session)
-        assert all(record["type"] != "compaction" for record in records)
+        compaction = next(
+            record for record in records if record["type"] == "compaction"
+        )
+        assert compaction["degraded"] is True
         assert any(
-            record["type"] == "note" and "compaction failed" in record["text"]
+            record["type"] == "note" and "compaction degraded" in record["text"]
             for record in records
         )
-        # 没有摘要消息，原始消息保持原样。
-        assert session.messages[0] == {"role": "user", "content": "read it"}
+        # 降级摘要仍然替换了上下文，任务继续。
+        assert session.messages[0]["content"].startswith("[历史摘要]\n")
     finally:
         session.close()
 
 
-def test_summary_failure_is_not_retried_every_step(tmp_path: Path) -> None:
-    llm = FakeLLM(
-        [
-            (_tool_call(call_id="call_1"), {"prompt_tokens": 200_000}),
-            (_tool_call(call_id="call_2"), {"prompt_tokens": 200_000}),
-            (_final("kept going"), {}),
-        ],
-        summary_error=RuntimeError("summary backend down"),
-    )
-    loop, session = _make_loop(tmp_path, llm, max_steps=5)
+def test_only_summary_prefix_is_not_recompacted(tmp_path: Path) -> None:
+    """保留区仍然超预算、但前缀只剩旧摘要时，不再重复摘要。"""
+    llm = FakeLLM([])
+    loop, session = _make_loop(tmp_path, llm, context_window=1_000, reserve_tokens=100)
     try:
-        events = list(loop.run("read it"))
+        session.append({"role": "user", "content": SUMMARY_PREFIX + "旧摘要"})
+        session.append(_tool_call(call_id="call_1"))
+        session.append(
+            {"role": "tool", "tool_call_id": "call_1", "content": "x" * 2_000}
+        )
 
-        # 失败后上下文没有明显增长：下个 step 不再重复调用摘要。
-        assert len(llm.summary_prompts) == 1
-        assert any(isinstance(event, CompactionFailed) for event in events)
-        assert isinstance(events[-1], FinalAnswer)
-        assert events[-1].text == "kept going"
+        assert list(loop._compact()) == []
+        assert llm.summary_prompts == []
     finally:
         session.close()
 
 
-def test_compaction_failure_retries_after_context_grows(
-    tmp_path: Path,
-) -> None:
-    llm = FakeLLM(
-        [
-            (_tool_call(name="huge", arguments="{}", call_id="call_1"), {"prompt_tokens": 200_000}),
-            (_tool_call(name="huge", arguments="{}", call_id="call_2"), {"prompt_tokens": 200_000}),
-            (_final("kept going"), {}),
-        ],
-        summary_error=RuntimeError("summary backend down"),
-    )
-    loop, session = _make_loop(
-        tmp_path,
-        llm,
-        max_steps=5,
-        tools=[HugeOutputTool()],
-    )
-    try:
-        events = list(loop.run("read it"))
-
-        # 第一次失败后上下文又增长了两万多 tokens，超过 4096 的退避阈值，允许重试。
-        assert len(llm.summary_prompts) == 2
-        failures = [
-            event for event in events if isinstance(event, CompactionFailed)
-        ]
-        assert len(failures) == 2
-        assert isinstance(events[-1], FinalAnswer)
-    finally:
-        session.close()
-
-
-def test_compaction_failure_retries_on_next_run(tmp_path: Path) -> None:
-    llm = FakeLLM(
-        [
-            (_tool_call(), {"prompt_tokens": 200_000}),
-            (_final(), {"prompt_tokens": 200_000}),
-            (_final("second"), {}),
-        ],
-        summary_error=RuntimeError("summary backend down"),
-    )
-    loop, session = _make_loop(tmp_path, llm, max_steps=5)
-    try:
-        list(loop.run("first"))
-        assert len(llm.summary_prompts) == 1
-
-        # 新的一轮用户任务允许重试；不要因为上一轮失败而永久禁用。
-        list(loop.run("second"))
-        assert len(llm.summary_prompts) == 2
-    finally:
-        session.close()
-
-
-def test_summary_missing_critical_facts_does_not_compact(
+def test_summary_missing_critical_facts_is_salvaged(
     tmp_path: Path,
 ) -> None:
     generic = _valid_summary("SUMMARY")  # 没有 /proj/app/main.py 和 ERROR 原文
@@ -519,15 +467,19 @@ def test_summary_missing_critical_facts_does_not_compact(
     try:
         events = list(loop.run("修复导入错误"))
 
-        failures = [
-            event for event in events if isinstance(event, CompactionFailed)
-        ]
-        assert len(failures) == 1
-        assert failures[0].reason == "invalid_summary"
-        assert "critical facts" in failures[0].error
-        assert all(
-            record["type"] != "compaction" for record in _records(session)
+        dones = [event for event in events if isinstance(event, CompactionDone)]
+        assert len(dones) == 1
+        # 模型摘要可用，只是漏了事实；确定性补齐，不算降级。
+        assert dones[0].degraded is False
+        assert not any(
+            isinstance(event, CompactionFailed) for event in events
         )
+
+        compaction = next(
+            record for record in _records(session) if record["type"] == "compaction"
+        )
+        assert "/proj/app/main.py" in compaction["summary"]
+        assert "ERROR: [Errno 2] No such file or directory" in compaction["summary"]
         assert isinstance(events[-1], FinalAnswer)
     finally:
         session.close()
@@ -626,11 +578,11 @@ def test_oversized_tail_tool_output_is_dropped(tmp_path: Path) -> None:
         assert "ERROR: [Errno 2] No such file or directory" in request_text
         assert "/proj/app/main.py" in request_text
 
-        # 摘要输入被截断到窗口预算内，但头尾都保留。
+        # 摘要输入按 pi 的规则只留工具结果头部。
         prompt = llm.summary_prompts[0]
-        assert "truncated" in prompt
+        assert "more characters truncated" in prompt
         assert "ERROR: [Errno 2] No such file or directory" in prompt
-        assert f"trace line {HUGE_LINES - 1}" in prompt
+        assert f"trace line {HUGE_LINES - 1}" not in prompt
 
         assert session.messages[0]["content"].startswith("[历史摘要]\n")
         assert len(session.messages) == 2  # 摘要 + 最终回答
@@ -705,12 +657,13 @@ def test_huge_tool_output_is_dropped_after_compaction(tmp_path: Path) -> None:
 
         assert isinstance(events[-1], FinalAnswer)
         assert len(llm.summary_prompts) == 1
-        # 摘要输入包含完整前缀：目标、关键路径、错误原文都在。
+        # 摘要输入包含前缀目标、关键路径和错误原文；工具结果只留头部。
         prompt = llm.summary_prompts[0]
         assert "修复导入错误，先看日志" in prompt
         assert "/proj/app/main.py" in prompt
         assert "ERROR: [Errno 2] No such file or directory" in prompt
-        assert f"trace line {HUGE_LINES - 1}" in prompt
+        assert "more characters truncated" in prompt
+        assert f"trace line {HUGE_LINES - 1}" not in prompt
 
         # 压缩后的下一条正常请求不再带 5000 行输出，但保留摘要里的关键信息。
         next_request = llm.calls[2]
@@ -724,5 +677,128 @@ def test_huge_tool_output_is_dropped_after_compaction(tmp_path: Path) -> None:
         assert any(
             record["type"] == "compaction" for record in _records(session)
         )
+    finally:
+        session.close()
+
+def test_split_turn_uses_history_and_turn_prefix_summaries(
+    tmp_path: Path,
+) -> None:
+    history_summary = _valid_summary("HISTORY")
+    turn_summary = "\n".join(
+        [
+            "## Original Request",
+            "- second",
+            "## Progress So Far",
+            "- 还没开始",
+            "## Context Needed to Continue",
+            "- 继续",
+        ]
+    )
+    llm = FakeLLM(
+        [
+            (_tool_call(call_id="call_1"), {"prompt_tokens": 50}),
+            (_final("first done"), {}),
+            (_tool_call(call_id="call_2"), {"prompt_tokens": 200_000}),
+            (_final("done"), {}),
+        ],
+        summaries=[history_summary, turn_summary],
+    )
+    loop, session = _make_loop(tmp_path, llm, max_steps=5)
+    path = session.path
+    try:
+        list(loop.run("first"))
+        events = list(loop.run("second"))
+        effective = list(session.messages)
+    finally:
+        session.close()
+
+    assert len(llm.summary_prompts) == 2
+    # 第一段是历史（不含当前轮次），第二段只覆盖当前轮次被丢弃的前缀。
+    assert "first" in llm.summary_prompts[0]
+    assert "## Original Request" in llm.summary_prompts[1]
+    assert "second" in llm.summary_prompts[1]
+
+    compaction = next(
+        record for record in _records(session) if record["type"] == "compaction"
+    )
+    # messages = [user1, a1, t1, final1, user2, a3, t3]；切在 a3。
+    assert compaction["cut_index"] == 5
+    assert compaction["messages_before"] == 7
+    assert history_summary in compaction["summary"]
+    assert turn_summary in compaction["summary"]
+    assert "**Turn Context (split turn):**" in compaction["summary"]
+
+    assert isinstance(events[-1], FinalAnswer)
+    loaded = Session.load(path, tmp_path)
+    try:
+        assert loaded.messages == effective
+        assert loaded.messages[0]["content"].startswith("[历史摘要]\n")
+    finally:
+        loaded.close()
+
+
+def test_context_tokens_uses_usage_plus_trailing(tmp_path: Path) -> None:
+    from keeper.compaction import estimate_request_tokens, estimate_tokens
+
+    llm = FakeLLM([])
+    loop, session = _make_loop(
+        tmp_path, llm, context_window=100_000, reserve_tokens=1_000
+    )
+    try:
+        session.append({"role": "user", "content": "u"})
+        session.append({"role": "assistant", "content": "a"})
+        loop._usage_tokens = 5_000
+        loop._usage_index = 1
+        session.append({"role": "tool", "tool_call_id": "c1", "content": "x" * 300})
+
+        assert loop._context_tokens() == 5_000 + estimate_tokens(
+            session.messages[2:]
+        )
+
+        # 没有 usage 时退到全量估算，并把工具 schema 算进去。
+        loop._usage_tokens = None
+        loop._usage_index = None
+        assert loop._context_tokens() == estimate_request_tokens(
+            [{"role": "system", "content": loop.system}, *session.messages],
+            loop.registry.schemas(),
+        )
+    finally:
+        session.close()
+
+
+def test_record_usage_prefers_total_tokens(tmp_path: Path) -> None:
+    llm = FakeLLM([])
+    loop, session = _make_loop(tmp_path, llm)
+    try:
+        session.append({"role": "assistant", "content": "a"})
+
+        class Response:
+            usage = {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            }
+
+        loop._record_usage(Response())
+        assert loop._usage_tokens == 15
+        assert loop._usage_index == 0
+
+        # 没有 total_tokens 时用 prompt + completion。
+        class Partial:
+            usage = {"prompt_tokens": 10, "completion_tokens": 5}
+
+        loop._record_usage(Partial())
+        assert loop._usage_tokens == 15
+
+        # 空 usage 不产生有效记录。
+        loop._usage_tokens = None
+        loop._usage_index = None
+
+        class Empty:
+            usage = {}
+
+        loop._record_usage(Empty())
+        assert loop._usage_tokens is None
+        assert loop._usage_index is None
     finally:
         session.close()

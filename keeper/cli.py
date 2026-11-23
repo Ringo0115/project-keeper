@@ -93,9 +93,10 @@ def render(events: Iterable[Event]) -> None:
                 file=sys.stderr,
             )
         elif isinstance(event, CompactionDone):
+            suffix = " · degraded" if event.degraded else ""
             print(
                 f"[compaction] done · {event.tokens_before} -> "
-                f"{event.tokens_after} tokens",
+                f"{event.tokens_after} tokens{suffix}",
                 file=sys.stderr,
             )
         elif isinstance(event, CompactionFailed):
