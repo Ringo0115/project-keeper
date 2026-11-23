@@ -11,6 +11,13 @@ from typing import Any
 
 SESSIONS_DIR = Path(".agent") / "sessions"
 
+# 压缩后放进有效消息列表的第一条；和 compaction 记录回放共用。
+SUMMARY_PREFIX = "[历史摘要]\n"
+
+
+def _summary_message(summary: str) -> dict[str, Any]:
+    return {"role": "user", "content": SUMMARY_PREFIX + summary}
+
 
 class Session:
     """一个项目下的一段对话。文件只追加，不重写。"""
@@ -66,7 +73,29 @@ class Session:
                     meta = record
                 elif record.get("type") == "message" and isinstance(record.get("message"), dict):
                     messages.append(record["message"])
+                elif record.get("type") == "compaction":
+                    messages = cls._apply_compaction(record, messages)
         return cls(path, Path(root).resolve(), meta.get("session_id") or path.stem, messages)
+
+    @staticmethod
+    def _apply_compaction(
+        record: dict[str, Any], messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """按 JSONL 顺序回放一条 compaction 记录。
+
+        cut_index 是「记录写入时有效消息列表」的下标，因此连续压缩时
+        第二条记录仍然指向回放后的列表，不需要额外换算。
+        """
+        summary = record.get("summary")
+        cut_index = record.get("cut_index")
+        if (
+            not isinstance(summary, str)
+            or type(cut_index) is not int
+            or not 0 <= cut_index <= len(messages)
+        ):
+            # 损坏的记录不能删（只追加），但也不该破坏加载；跳过它。
+            return messages
+        return [_summary_message(summary), *messages[cut_index:]]
 
     @staticmethod
     def latest(root: Path) -> Path | None:
@@ -82,6 +111,35 @@ class Session:
 
     def note(self, text: str) -> None:
         self._write({"type": "note", "ts": time.time(), "text": text})
+
+    def compact(
+        self,
+        summary: str,
+        cut_index: int,
+        *,
+        tokens_before: int = 0,
+        tokens_after: int | None = None,
+    ) -> None:
+        """追加一条 compaction 记录，并把内存消息换成「摘要 + 切点之后」。
+
+        旧 message 记录原样留在 JSONL 里；加载时按顺序回放 compaction。
+        """
+        if type(cut_index) is not int or not 0 <= cut_index <= len(self.messages):
+            raise ValueError(f"invalid cut_index: {cut_index!r}")
+
+        messages_before = len(self.messages)
+        record = {
+            "type": "compaction",
+            "ts": time.time(),
+            "summary": summary,
+            "cut_index": cut_index,
+            "messages_before": messages_before,
+            "tokens_before": tokens_before,
+        }
+        if tokens_after is not None:
+            record["tokens_after"] = tokens_after
+        self._write(record)
+        self.messages = [_summary_message(summary), *self.messages[cut_index:]]
 
     def _write(self, record: dict[str, Any]) -> None:
         self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")

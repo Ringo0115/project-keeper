@@ -8,10 +8,24 @@ from pathlib import Path
 from typing import Any, Generator, Iterator, Protocol
 
 from keeper.approval import Approver, Decision, review
+from keeper.compaction import (
+    SummaryError,
+    estimate_tokens,
+    find_cut_index,
+    summarize,
+)
+from keeper.config import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_KEEP_TOKENS,
+    DEFAULT_RESERVE_TOKENS,
+)
 from keeper.events import (
     ApprovalRequest,
     ApprovalResult,
     AssistantText,
+    CompactionDone,
+    CompactionFailed,
+    CompactionStart,
     ErrorEvent,
     Event,
     FinalAnswer,
@@ -22,9 +36,12 @@ from keeper.events import (
     UserMessage,
 )
 from keeper.prompts import TaskContext, system_prompt
-from keeper.session import Session
+from keeper.session import SUMMARY_PREFIX, Session
 from keeper.tools.base import ToolResult, error
 from keeper.tools.registry import Registry
+
+# 摘要失败后，上下文至少再增长这么多 tokens 才重试，避免每个 step 重复付费。
+COMPACTION_RETRY_MARGIN_TOKENS = 4096
 
 
 class ChatLLM(Protocol):
@@ -32,6 +49,7 @@ class ChatLLM(Protocol):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
     ) -> Any: ...
 
 
@@ -46,6 +64,9 @@ class AgentLoop:
         max_steps: int = 30,
         approver: Approver | None = None,
         task: TaskContext | None = None,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+        keep_tokens: int = DEFAULT_KEEP_TOKENS,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -54,20 +75,133 @@ class AgentLoop:
         self.max_steps = max_steps
         self.root = Path(root).resolve()
         self.approver = approver
+        self.context_window = context_window
+        self.reserve_tokens = reserve_tokens
+        self.keep_tokens = keep_tokens
+        # 上一次正常 chat 的 prompt token 数；None 表示还没有可判断的响应。
+        self._last_prompt_tokens: int | None = None
+        # 摘要失败时的上下文大小；上下文没明显增长前不重试。
+        self._compaction_failed_at: int | None = None
 
     def _messages(self) -> list[dict[str, Any]]:
         return [{"role": "system", "content": self.system}, *self.session.messages]
 
+    def _should_compact(self) -> bool:
+        # usage 只覆盖上一次请求；之后的 assistant / tool 消息还没算进去。
+        # 当前上下文估算兜住「工具输出把窗口推过阈值」的情况，
+        # 也让 resume 时已经过大的会话在第一次请求前就能压缩。
+        current = self._context_tokens()
+        if (
+            self._compaction_failed_at is not None
+            and current
+            < self._compaction_failed_at + COMPACTION_RETRY_MARGIN_TOKENS
+        ):
+            return False
+        observed = self._last_prompt_tokens or 0
+        threshold = self.context_window - self.reserve_tokens
+        return max(observed, current) > threshold
+
+    def _context_tokens(self) -> int:
+        return estimate_tokens(self._messages())
+
+    def _record_usage(self, response: Any, request_estimate: int) -> None:
+        """记录下一次判断要用的 prompt tokens；usage 缺失时用估算兜底。"""
+        usage = getattr(response, "usage", None)
+        if isinstance(usage, dict):
+            try:
+                prompt_tokens = int(usage.get("prompt_tokens"))
+            except (TypeError, ValueError):
+                prompt_tokens = None
+            if prompt_tokens is not None and prompt_tokens >= 0:
+                self._last_prompt_tokens = prompt_tokens
+                return
+        self._last_prompt_tokens = request_estimate
+
+    def _compact(self) -> Iterator[Event]:
+        """压缩一次；失败只发事件和 note，不让任务中断。"""
+        threshold = self.context_window - self.reserve_tokens
+        messages = self.session.messages
+        cut_index = find_cut_index(
+            messages,
+            self.keep_tokens,
+            estimate_tokens,
+            max_tail_tokens=threshold,
+        )
+        tokens_before = self._last_prompt_tokens or self._context_tokens()
+
+        if cut_index <= 0:
+            # 没有可丢弃的前缀：重置判断值，避免每个 step 重复检查。
+            self._last_prompt_tokens = self._context_tokens()
+            self._compaction_failed_at = None
+            return
+
+        yield CompactionStart(
+            tokens_before=tokens_before,
+            cut_index=cut_index,
+            reason="threshold",
+        )
+
+        messages_before = len(messages)
+        try:
+            summary = summarize(
+                self.llm,
+                messages[:cut_index],
+                max_input_tokens=max(1, threshold),
+            )
+            projected = [
+                {"role": "system", "content": self.system},
+                {"role": "user", "content": SUMMARY_PREFIX + summary},
+                *messages[cut_index:],
+            ]
+            tokens_after = estimate_tokens(projected)
+            self.session.compact(
+                summary,
+                cut_index,
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+            )
+        except Exception as exc:
+            reason = "invalid_summary" if isinstance(exc, SummaryError) else "summary_error"
+            self.session.note(f"compaction failed: {type(exc).__name__}: {exc}")
+            tokens_after = self._context_tokens()
+            self._compaction_failed_at = tokens_after
+            yield CompactionFailed(
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+                cut_index=cut_index,
+                reason=reason,
+                error=str(exc),
+            )
+            return
+
+        # 用估算值重置，避免下一步立刻按旧 usage 重复触发。
+        self._last_prompt_tokens = tokens_after
+        self._compaction_failed_at = None
+        yield CompactionDone(
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            cut_index=cut_index,
+            messages_before=messages_before,
+            messages_after=len(self.session.messages),
+        )
+
     def run(self, user_text: str) -> Iterator[Event]:
+        # 新的一轮用户任务：允许摘要失败后重新尝试一次。
+        self._compaction_failed_at = None
         self.session.append({"role": "user", "content": user_text})
         yield UserMessage(text=user_text)
 
         for step in range(1, self.max_steps + 1):
             yield StepStart(step=step)
 
+            if self._should_compact():
+                yield from self._compact()
+
+            request_messages = self._messages()
+            request_estimate = estimate_tokens(request_messages)
             try:
                 response = self.llm.chat(
-                    self._messages(),
+                    request_messages,
                     tools=self.registry.schemas(),
                 )
             except Exception as exc:
@@ -77,6 +211,7 @@ class AgentLoop:
 
             message = response.message
             self.session.append(message)
+            self._record_usage(response, request_estimate)
             text = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
 

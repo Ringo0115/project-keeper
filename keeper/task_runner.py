@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Iterator
 
 from keeper.approval import Approver
+from keeper.config import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_KEEP_TOKENS,
+    DEFAULT_RESERVE_TOKENS,
+)
 from keeper.events import Event, FinalAnswer, TaskEvent, ToolResultEvent
 from keeper.loop import AgentLoop, ChatLLM
 from keeper.prompts import TaskContext
@@ -107,6 +112,9 @@ def run_task_once(
     registry: Registry,
     approver: Approver | None,
     max_steps: int = 30,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+    keep_tokens: int = DEFAULT_KEEP_TOKENS,
 ) -> Iterator[Event]:
     """跑一次 attempt，并在 loop 正常结束后按结束方式收尾。
 
@@ -134,6 +142,9 @@ def run_task_once(
         root=prepared.root,
         max_steps=max_steps,
         approver=approver,
+        context_window=context_window,
+        reserve_tokens=reserve_tokens,
+        keep_tokens=keep_tokens,
         task=TaskContext(
             id=task.id,
             title=task.title,

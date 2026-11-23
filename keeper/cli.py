@@ -16,6 +16,9 @@ from keeper.events import (
     ApprovalRequest,
     ApprovalResult,
     AssistantText,
+    CompactionDone,
+    CompactionFailed,
+    CompactionStart,
     ErrorEvent,
     Event,
     FinalAnswer,
@@ -83,6 +86,21 @@ def render(events: Iterable[Event]) -> None:
             print(f"error: {event.message}", file=sys.stderr)
         elif isinstance(event, Stop):
             print(f"[stopped: {event.reason}]", file=sys.stderr)
+        elif isinstance(event, CompactionStart):
+            print(
+                f"[compaction] start · {event.tokens_before} tokens · "
+                f"cut={event.cut_index}",
+                file=sys.stderr,
+            )
+        elif isinstance(event, CompactionDone):
+            print(
+                f"[compaction] done · {event.tokens_before} -> "
+                f"{event.tokens_after} tokens",
+                file=sys.stderr,
+            )
+        elif isinstance(event, CompactionFailed):
+            detail = event.error or event.reason
+            print(f"[compaction] failed: {_short(detail, 160)}", file=sys.stderr)
         elif isinstance(event, TaskEvent):
             line = f"[task] {event.action} {event.task_id} status={event.status}"
             if event.detail:
@@ -242,6 +260,9 @@ def _execute_task(
                 registry=_build_registry(root),
                 approver=StdioApprover(timeout=config.approval_timeout),
                 max_steps=config.max_steps,
+                context_window=config.context_window,
+                reserve_tokens=config.reserve_tokens,
+                keep_tokens=config.keep_tokens,
             ),
         )
         try:
@@ -398,6 +419,9 @@ def _chat_main(argv: list[str]) -> int:
         root=root,
         max_steps=config.max_steps,
         approver=approver,
+        context_window=config.context_window,
+        reserve_tokens=config.reserve_tokens,
+        keep_tokens=config.keep_tokens,
     )
     start = SessionStart(
         session_id=session.session_id,

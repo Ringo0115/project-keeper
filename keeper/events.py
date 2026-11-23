@@ -105,6 +105,38 @@ class ErrorEvent(Event):
 
 
 @dataclass
+class CompactionStart(Event):
+    """开始压缩：把切点之前的前缀送去摘要。"""
+
+    type: ClassVar[str] = "compaction_start"
+    tokens_before: int = 0
+    cut_index: int = 0
+    reason: str = "threshold"
+
+
+@dataclass
+class CompactionDone(Event):
+    type: ClassVar[str] = "compaction_done"
+    tokens_before: int = 0
+    tokens_after: int = 0
+    cut_index: int = 0
+    messages_before: int = 0
+    messages_after: int = 0
+
+
+@dataclass
+class CompactionFailed(Event):
+    """摘要失败：不写 compaction、不中断任务。"""
+
+    type: ClassVar[str] = "compaction_failed"
+    tokens_before: int = 0
+    tokens_after: int = 0
+    cut_index: int = 0
+    reason: str = ""
+    error: str = ""
+
+
+@dataclass
 class TaskEvent(Event):
     """任务队列状态变化：入队、开始 attempt、完成、阻塞、恢复。"""
 

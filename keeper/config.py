@@ -11,6 +11,9 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_MAX_STEPS = 30
 DEFAULT_APPROVAL_TIMEOUT = 60.0
+DEFAULT_CONTEXT_WINDOW = 65536
+DEFAULT_RESERVE_TOKENS = 16384
+DEFAULT_KEEP_TOKENS = 20000
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,9 @@ class Config:
     max_steps: int = DEFAULT_MAX_STEPS
     temperature: float = 0.2
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT
+    context_window: int = DEFAULT_CONTEXT_WINDOW
+    reserve_tokens: int = DEFAULT_RESERVE_TOKENS
+    keep_tokens: int = DEFAULT_KEEP_TOKENS
 
 
 def _int_env(name: str, default: int) -> int:
@@ -53,10 +59,16 @@ def load_config(*, model: str | None = None, max_steps: int | None = None) -> Co
     approval_timeout = _float_env(
         "KEEPER_APPROVAL_TIMEOUT", DEFAULT_APPROVAL_TIMEOUT
     )
+    context_window = _int_env("KEEPER_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)
+    reserve_tokens = _int_env("KEEPER_RESERVE_TOKENS", DEFAULT_RESERVE_TOKENS)
+    keep_tokens = _int_env("KEEPER_KEEP_TOKENS", DEFAULT_KEEP_TOKENS)
     return Config(
         base_url=base_url,
         api_key=api_key,
         model=model_name,
         max_steps=max(steps, 1),
         approval_timeout=max(approval_timeout, 0.0),
+        context_window=max(context_window, 1),
+        reserve_tokens=max(reserve_tokens, 0),
+        keep_tokens=max(keep_tokens, 1),
     )

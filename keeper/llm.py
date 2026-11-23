@@ -49,11 +49,12 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "temperature": self._temperature,
+            "temperature": self._temperature if temperature is None else temperature,
         }
         if tools:
             payload["tools"] = tools
