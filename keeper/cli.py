@@ -34,6 +34,7 @@ from keeper.loop import AgentLoop
 from keeper.session import Session
 from keeper.task_runner import TaskRunError, prepare_task_run, run_task_once
 from keeper.tasks import Task, TaskStore, TaskStoreError
+from keeper.tidy import check_due, format_check, read_run_record, run_tidy
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
 from keeper.tools.memory import UpdateMemoryTool
 from keeper.tools.registry import Registry
@@ -142,19 +143,27 @@ def _open_session(
     return Session.create(root, model), False
 
 
-def _repl(loop: AgentLoop, session: Session) -> int:
+def _repl(loop: AgentLoop, session: Session) -> tuple[int, bool]:
+    """交互模式；返回 ``(exit_code, clean_exit)``。
+
+    只有 ``/exit``、``/quit`` 或 EOF 算 clean_exit；输入提示处 Ctrl+C
+    不算，调用方据此决定是否在会话结束后自动整理记忆。
+    """
     print("输入任务，/exit 退出，/session 查看会话文件。\n")
     while True:
         try:
             text = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
-            return 0
+            return 0, True
+        except KeyboardInterrupt:
+            print()
+            return 0, False
 
         if not text:
             continue
         if text in ("/exit", "/quit"):
-            return 0
+            return 0, True
         if text == "/session":
             print(session.path)
             continue
@@ -226,7 +235,12 @@ def _print_task_list(store: TaskStore) -> None:
 
 
 def _execute_task(
-    root: Path, store: TaskStore, task: Task, config: Config
+    root: Path,
+    store: TaskStore,
+    task: Task,
+    config: Config,
+    *,
+    no_tidy: bool = False,
 ) -> int:
     try:
         prepared = prepare_task_run(store, task.id, root, config.model)
@@ -274,6 +288,14 @@ def _execute_task(
                 file=sys.stderr,
             )
             return 130
+        _maybe_auto_tidy(
+            root,
+            config,
+            llm,
+            "task",
+            no_tidy=no_tidy,
+            session_id=prepared.session.session_id,
+        )
         return 0
     finally:
         if llm is not None:
@@ -296,6 +318,11 @@ def _task_main(argv: list[str]) -> int:
     sub.add_parser("list", parents=[common], help="列出任务")
     run_parser = sub.add_parser("run", parents=[common], help="运行队首或指定任务")
     run_parser.add_argument("id", nargs="?", help="任务 id；省略则跑队首 queued 任务")
+    run_parser.add_argument(
+        "--no-tidy",
+        action="store_true",
+        help="本次 attempt 结束后不自动整理项目记忆",
+    )
 
     args = parser.parse_args(argv)
 
@@ -337,6 +364,9 @@ def _task_main(argv: list[str]) -> int:
         print(_api_key_error(), file=sys.stderr)
         return 2
 
+    no_tidy = args.no_tidy
+    _startup_tidy_hint(root, _tidy_enabled(config, no_tidy))
+
     if args.id:
         task = store.get(args.id)
         if task is None:
@@ -354,7 +384,137 @@ def _task_main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    return _execute_task(root, store, task, config)
+    return _execute_task(root, store, task, config, no_tidy=no_tidy)
+
+
+# ---------------------------------------------------------------------------
+# M5 记忆治理
+# ---------------------------------------------------------------------------
+
+
+def _memory_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="keeper memory", description="项目记忆治理（M5）"
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录"
+    )
+    common.add_argument("--model", help="覆盖模型名")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+    tidy_parser = sub.add_parser(
+        "tidy", parents=[common], help="整理记忆（force，跳 due 闸门）"
+    )
+    tidy_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="只读查看 due / 预算 / 上次报告，不整理",
+    )
+
+    args = parser.parse_args(argv)
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    if args.check:
+        try:
+            decision = check_due(root)
+            report = read_run_record(root)
+        except Exception as exc:
+            print(
+                f"error: cannot check memory: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        print(format_check(root, decision, report))
+        return 0
+
+    config = load_config(model=args.model)
+    if not config.api_key:
+        print(_api_key_error(), file=sys.stderr)
+        return 2
+
+    llm = LLMClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model=config.model,
+        temperature=config.temperature,
+    )
+    try:
+        report = run_tidy(root, llm, force=True, trigger="manual")
+    except Exception as exc:
+        print(
+            f"error: tidy failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        llm.close()
+
+    print(report.text())
+    if report.error:
+        print(f"error: {report.error}", file=sys.stderr)
+    if report.outcome == "failed":
+        return 2
+    if report.outcome == "locked":
+        print("[memory] tidy lock busy; retry later", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 自动整理（M5.0 切片 5）
+# ---------------------------------------------------------------------------
+
+
+def _tidy_enabled(config: Config, no_tidy: bool) -> bool:
+    return config.memory_auto and not no_tidy
+
+
+def _startup_tidy_hint(root: Path, enabled: bool) -> None:
+    """启动时的廉价 due 检查：只读、只提示，不同步整理、不调用 LLM。"""
+    if not enabled:
+        return
+    try:
+        decision = check_due(root)
+    except Exception:
+        return
+    if decision.due:
+        print(f"[memory] tidy due: {decision.reason_text()}", file=sys.stderr)
+
+
+def _maybe_auto_tidy(
+    root: Path,
+    config: Config,
+    llm: LLMClient,
+    trigger: str,
+    *,
+    no_tidy: bool = False,
+    session_id: str | None = None,
+) -> None:
+    """会话 / attempt 正常结束后同步整理；任何失败都只提示，不改退出码。"""
+    if not _tidy_enabled(config, no_tidy):
+        return
+    try:
+        report = run_tidy(
+            root, llm, force=False, trigger=trigger, session_id=session_id
+        )
+    except Exception as exc:
+        print(
+            f"[memory] tidy warning: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    if report.outcome == "skipped":
+        return
+    if report.outcome in {"failed", "locked"}:
+        detail = report.error or report.reason or "unknown error"
+        print(f"[memory] tidy warning: {detail}", file=sys.stderr)
+        return
+    print(f"[memory] {report.text()}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +530,11 @@ def _chat_main(argv: list[str]) -> int:
     parser.add_argument("--session", type=Path, help="加载指定会话文件")
     parser.add_argument("--model", help="覆盖模型名")
     parser.add_argument("--max-steps", type=int, help="单个任务的最大步数")
+    parser.add_argument(
+        "--no-tidy",
+        action="store_true",
+        help="本次会话结束后不自动整理项目记忆",
+    )
     parser.add_argument("--version", action="version", version=f"keeper {__version__}")
     args = parser.parse_args(argv)
 
@@ -383,6 +548,9 @@ def _chat_main(argv: list[str]) -> int:
         print(_api_key_error(), file=sys.stderr)
         return 2
 
+    no_tidy = args.no_tidy
+    _startup_tidy_hint(root, _tidy_enabled(config, no_tidy))
+
     # --resume 先读 task 再读 session：恢复后若有 queued 任务，跑队首任务。
     if args.resume:
         store = _load_recovered_store(root)
@@ -390,7 +558,7 @@ def _chat_main(argv: list[str]) -> int:
             return 2
         task = store.next_queued()
         if task is not None:
-            return _execute_task(root, store, task, config)
+            return _execute_task(root, store, task, config, no_tidy=no_tidy)
 
     try:
         session, resumed = _open_session(args, root, config.model)
@@ -434,9 +602,27 @@ def _chat_main(argv: list[str]) -> int:
     try:
         if args.task:
             render(chain([start], loop.run(" ".join(args.task))))
+            _maybe_auto_tidy(
+                root,
+                config,
+                llm,
+                "chat",
+                no_tidy=no_tidy,
+                session_id=session.session_id,
+            )
             return 0
         render([start])
-        return _repl(loop, session)
+        rc, clean_exit = _repl(loop, session)
+        if clean_exit:
+            _maybe_auto_tidy(
+                root,
+                config,
+                llm,
+                "repl",
+                no_tidy=no_tidy,
+                session_id=session.session_id,
+            )
+        return rc
     except KeyboardInterrupt:
         print("\ninterrupted; session saved.", file=sys.stderr)
         return 130
@@ -448,6 +634,17 @@ def _chat_main(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
     raw = list(sys.argv[1:] if argv is None else argv)
+
+    if raw and raw[0] == "memory":
+        try:
+            return _memory_main(raw[1:])
+        except KeyboardInterrupt:
+            print(
+                "\ninterrupted; memory files may be partially written; "
+                "a backup exists under .agent/memory/backups/.",
+                file=sys.stderr,
+            )
+            return 130
 
     if raw and raw[0] == "task":
         try:

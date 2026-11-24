@@ -419,8 +419,14 @@ def test_supersede_moves_old_block_verbatim_to_archive(tmp_path: Path) -> None:
     assert "  supersedes: - 测试框架用 unittest" in live
     assert "  更快，插件多。" in live
 
-    # 旧条目整块原样在 archive；live 里不再有旧 entry 块。
-    assert old_block in archive
+    # 旧条目整块在 archive；M5.0 起 bullet 下多一行 mem 注释。
+    assert "- 测试框架用 unittest" in archive
+    assert "旧理由：标准库自带。" in archive
+    assert "旧细节：不需要额外依赖。" in archive
+    bullet_at = archive.index("- 测试框架用 unittest")
+    comment_at = archive.index("<!--mem id:", bullet_at)
+    detail_at = archive.index("  旧理由：标准库自带。", bullet_at)
+    assert bullet_at < comment_at < detail_at
     assert archive.count("- 测试框架用 unittest") == 1
     assert "\n- 测试框架用 unittest\n" not in live
     assert "旧理由：标准库自带。" not in live

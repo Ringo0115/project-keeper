@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
+import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,6 +22,23 @@ PREVIEW_DIFF_LINES = 80
 ARCHIVE_SECTION = "Superseded"
 INDEX_NOTICE = "<!-- 自动生成，勿手改；由 keeper update_memory 维护 -->"
 MEMORY_SECTION_PREFIX = "## 项目记忆 / "
+
+# 每条 entry 的 id 戳。单独一行缩进注释，渲染 Markdown 时不可见；
+# 注入前由 inject_view 剥离，不占预算。
+MEM_COMMENT_RE = re.compile(r"<!--mem\s+(?P<body>.*?)-->")
+MEM_COMMENT_LINE_RE = re.compile(r"^\s*<!--mem\s+.*?-->\s*$")
+MEM_FIELD_ORDER = ("id", "created", "touched")
+
+# 预算口径：UTF-8 字节 // 3。计入 bullet 与缩进细节，不含 mem 注释和
+# archive；INDEX 是导航文件，单独给一档。
+FILE_BUDGETS: dict[str, dict[str, int]] = {
+    "decisions": {"soft": 3000, "hard": 4500},
+    "lessons": {"soft": 2500, "hard": 4000},
+    "project_state": {"soft": 1200, "hard": 1800},
+    "index": {"soft": 600, "hard": 900},
+}
+
+_LEAD_DATE_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?[:：]?\s*")
 
 FILE_NAMES: dict[str, str] = {
     "decisions": "DECISIONS.md",
@@ -47,13 +67,29 @@ class MemoryOpError(ValueError):
 
 @dataclass(frozen=True)
 class Entry:
-    """一个顶层 bullet 及其紧随的缩进细节。"""
+    """一个顶层 bullet 及其紧随的缩进细节。
+
+    ``mem`` 是紧贴 bullet 的 ``<!--mem …-->`` 字段；``mem_index`` 是它在
+    ``lines`` 里的下标（没有注释时为 None）。``details`` 不包含注释行。
+    """
 
     bullet: str
     section: str | None
     start: int
     end: int
     lines: tuple[str, ...]
+    mem: dict[str, str] | None = None
+    mem_index: int | None = None
+
+    @property
+    def details(self) -> tuple[str, ...]:
+        if self.mem_index is None:
+            return self.lines[1:]
+        return tuple(
+            line
+            for index, line in enumerate(self.lines)
+            if index > 0 and index != self.mem_index
+        )
 
 
 @dataclass(frozen=True)
@@ -83,6 +119,11 @@ class ApplyResult:
 
 def memory_path(root: Path, name: str) -> Path:
     return Path(root).resolve() / MEMORY_DIR / name
+
+
+def read_memory_text(root: Path, name: str) -> str | None:
+    """读取 .agent/memory/ 下的一个文件；不存在返回 None。"""
+    return _read_optional(memory_path(root, name))
 
 
 def _read_optional(path: Path) -> str | None:
@@ -140,6 +181,29 @@ def _rewrap(text: str, newline: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _mem_fields(line: str) -> dict[str, str] | None:
+    """解析 ``<!--mem id:… created:… touched:…-->``；没有返回 None。"""
+    match = MEM_COMMENT_RE.search(line)
+    if not match:
+        return None
+    fields: dict[str, str] = {}
+    for part in match.group("body").split():
+        if ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        if key and value:
+            fields[key] = value
+    return fields or None
+
+
+def _find_mem_comment(lines: tuple[str, ...]) -> tuple[dict[str, str] | None, int | None]:
+    for index, line in enumerate(lines):
+        fields = _mem_fields(line)
+        if fields is not None and MEM_COMMENT_LINE_RE.match(line):
+            return fields, index
+    return None, None
+
+
 def parse_entries(text: str | None) -> list[Entry]:
     """解析顶层 ``- `` entry；缩进行属于上一条 entry。"""
     lines = (text or "").splitlines()
@@ -161,13 +225,17 @@ def parse_entries(text: str | None) -> list[Entry]:
                 and lines[j][:1] in (" ", "\t")
             ):
                 j += 1
+            block = tuple(lines[i:j])
+            mem, mem_index = _find_mem_comment(block)
             entries.append(
                 Entry(
                     bullet=line,
                     section=section,
                     start=i,
                     end=j,
-                    lines=tuple(lines[i:j]),
+                    lines=block,
+                    mem=mem,
+                    mem_index=mem_index,
                 )
             )
             i = j
@@ -279,6 +347,340 @@ def _remove_entry(text: str, entry: Entry) -> str:
 
 def _entries_phrase(count: int) -> str:
     return f"{count} entry" if count == 1 else f"{count} entries"
+
+
+# ---------------------------------------------------------------------------
+# id 戳与 entry 守恒
+# ---------------------------------------------------------------------------
+
+
+def _normalise_title(title: str) -> str:
+    text = " ".join((title or "").replace("**", "").split())
+    return _LEAD_DATE_RE.sub("", text).strip().lower()
+
+
+def _entry_title(entry: Entry) -> str:
+    text = entry.bullet[2:] if entry.bullet.startswith("- ") else entry.bullet
+    return _normalise_title(text)
+
+
+def _entry_content(entry: Entry) -> str:
+    parts = [
+        entry.bullet[2:] if entry.bullet.startswith("- ") else entry.bullet,
+        *entry.details,
+    ]
+    return " ".join(" ".join(parts).replace("**", "").split())
+
+
+def _bullet_key(entry: Entry) -> str:
+    text = entry.bullet[2:] if entry.bullet.startswith("- ") else entry.bullet
+    return " ".join(text.replace("**", "").split())
+
+
+def new_entry_id(title: str, taken: set[str]) -> str:
+    """内容派生 id：纯 ASCII 用 slug，非 ASCII 用标题 sha1 前 6 位。"""
+    norm = _normalise_title(title)
+    slug = re.sub(r"[^a-z0-9]+", "-", norm).strip("-")[:32].strip("-")
+    if any(ord(char) > 127 for char in norm) or not slug:
+        base = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:6]
+    else:
+        base = slug
+    entry_id = base
+    suffix = 2
+    while entry_id in taken:
+        entry_id = f"{base}-{suffix}"
+        suffix += 1
+    return entry_id
+
+
+def entry_ids(text: str | None) -> set[str]:
+    """文件里所有 mem 注释携带的 id。"""
+    return {
+        entry.mem["id"]
+        for entry in parse_entries(text)
+        if entry.mem and entry.mem.get("id")
+    }
+
+
+def _comment_indent(entry: Entry) -> str:
+    if entry.mem_index is not None:
+        line = entry.lines[entry.mem_index]
+        return line[: len(line) - len(line.lstrip())] or "  "
+    for line in entry.details:
+        if line[:1] in (" ", "\t"):
+            return line[: len(line) - len(line.lstrip())] or "  "
+    return "  "
+
+
+def _format_mem_comment(fields: dict[str, str], indent: str) -> str:
+    ordered = [key for key in MEM_FIELD_ORDER if key in fields]
+    ordered.extend(key for key in fields if key not in MEM_FIELD_ORDER)
+    body = " ".join(f"{key}:{fields[key]}" for key in ordered)
+    return f"{indent}<!--mem {body}-->"
+
+
+def stamp_entries(
+    new_text: str,
+    old_text: str | Iterable[str] | None,
+    key: str,
+    *,
+    today: str | None = None,
+    archive_ids: set[str] | None = None,
+) -> tuple[str, list[str]]:
+    """给 entry 补 id / created / touched；已有 id 不重写。
+
+    ``old_text`` 可以是多份旧文本（live + archive），用于把整理后丢失
+    注释的条目按 bullet 原文重新绑定 id。内容变化只更新 ``touched``。
+    """
+    if key not in ENTRY_FILES or not new_text:
+        return new_text, []
+    today = today or date.today().isoformat()
+    warnings: list[str] = []
+
+    if old_text is None:
+        old_texts: list[str] = []
+    elif isinstance(old_text, str):
+        old_texts = [old_text]
+    else:
+        old_texts = [text for text in old_text if text]
+
+    old_by_id: dict[str, Entry] = {}
+    old_by_key: dict[str, list[Entry]] = {}
+    for text in old_texts:
+        for entry in parse_entries(text):
+            if entry.mem and entry.mem.get("id"):
+                old_by_id.setdefault(entry.mem["id"], entry)
+            old_by_key.setdefault(_bullet_key(entry), []).append(entry)
+
+    lines = new_text.splitlines()
+    entries = parse_entries(new_text)
+    by_start = {entry.start: entry for entry in entries}
+    taken: set[str] = set(archive_ids or ())
+    taken.update(old_by_id)
+    taken.update(
+        entry.mem["id"]
+        for entry in entries
+        if entry.mem and entry.mem.get("id")
+    )
+    used: set[str] = set()
+    claimed: set[int] = set()
+    rendered: dict[int, list[str]] = {}
+
+    for entry in entries:
+        fields: dict[str, str] | None = None
+        own_id = entry.mem.get("id") if entry.mem else None
+        own_old = old_by_id.get(own_id) if own_id else None
+        duplicate = bool(own_id and own_id in used)
+
+        if duplicate:
+            warnings.append(
+                f"entry id:{own_id} appeared twice; the second got a fresh id"
+            )
+            own_old = None
+        if own_old is not None and id(own_old) not in claimed:
+            fields = {**own_old.mem, **(entry.mem or {})}
+            claimed.add(id(own_old))
+            if _entry_content(entry) != _entry_content(own_old):
+                fields["touched"] = today
+        elif own_id and not duplicate:
+            fields = dict(entry.mem or {})
+        else:
+            for candidate in old_by_key.get(_bullet_key(entry), ()):
+                candidate_id = candidate.mem.get("id") if candidate.mem else None
+                if (
+                    id(candidate) in claimed
+                    or not candidate_id
+                    or candidate_id in used
+                ):
+                    continue
+                fields = dict(candidate.mem or {})
+                claimed.add(id(candidate))
+                if _entry_content(entry) != _entry_content(candidate):
+                    fields["touched"] = today
+                break
+
+        if fields is None:
+            fields = {"id": new_entry_id(_entry_title(entry), taken | used)}
+        fields.setdefault("created", today)
+        fields.setdefault("touched", fields["created"])
+        used.add(fields["id"])
+
+        block = list(entry.lines)
+        if entry.mem_index is not None:
+            block[entry.mem_index] = _format_mem_comment(
+                fields, _comment_indent(entry)
+            )
+        else:
+            block.insert(1, _format_mem_comment(fields, _comment_indent(entry)))
+        rendered[entry.start] = block
+
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        entry = by_start.get(index)
+        if entry is None:
+            out.append(lines[index])
+            index += 1
+            continue
+        out.extend(rendered[entry.start])
+        index = entry.end
+    return _join(out, _detect_newline(new_text)), warnings
+
+
+# ---------------------------------------------------------------------------
+# 预算与注入视图（纯函数，M6 上下文包复用）
+# ---------------------------------------------------------------------------
+
+
+def strip_mem_comments(text: str | None) -> str:
+    """去掉 mem 注释；CRLF 统一为 LF。"""
+    if not text:
+        return text or ""
+    out: list[str] = []
+    for line in text.splitlines():
+        if MEM_COMMENT_LINE_RE.match(line):
+            continue
+        if "<!--mem" in line:
+            line = MEM_COMMENT_RE.sub("", line).rstrip()
+        out.append(line)
+    result = "\n".join(out)
+    if text.endswith(("\n", "\r")) and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _tokens(text: str) -> int:
+    return len(text.encode("utf-8")) // 3
+
+
+def memory_tokens(text: str | None) -> int:
+    """预算口径：剥离 mem 注释后的 UTF-8 字节数 // 3。"""
+    return _tokens(strip_mem_comments(text))
+
+
+def over_soft_budget(text: str | None, key: str) -> bool:
+    budgets = FILE_BUDGETS.get(key)
+    return bool(budgets) and memory_tokens(text) > budgets["soft"]
+
+
+def over_hard_budget(text: str | None, key: str) -> bool:
+    budgets = FILE_BUDGETS.get(key)
+    return bool(budgets) and memory_tokens(text) > budgets["hard"]
+
+
+def _counter_note(key: str, count: int) -> str:
+    name = FILE_NAMES.get(key, "the memory file")
+    return (
+        f"- [... {count} more entries omitted — read .agent/memory/{name} "
+        "for the full text ...]"
+    )
+
+
+def _head_within(text: str, hard_budget: int) -> str:
+    note = (
+        "\n[... content trimmed from this view — read the file on disk "
+        "for the full text ...]"
+    )
+    if _tokens(text) <= hard_budget:
+        return text
+    kept: list[str] = []
+    for line in text.splitlines():
+        candidate = "\n".join([*kept, line]) + note
+        if _tokens(candidate) > hard_budget:
+            break
+        kept.append(line)
+    if not kept:
+        return note.lstrip("\n")
+    return "\n".join(kept) + note
+
+
+def _compact_view(text: str) -> str:
+    """只保留 bullet 行，去掉缩进细节。"""
+    lines = text.splitlines()
+    entries = parse_entries(text)
+    by_start = {entry.start: entry for entry in entries}
+    in_block: set[int] = set()
+    for entry in entries:
+        in_block.update(range(entry.start, entry.end))
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        entry = by_start.get(index)
+        if entry is not None:
+            out.append(strip_mem_comments(entry.bullet))
+            continue
+        if index in in_block or MEM_COMMENT_LINE_RE.match(line):
+            continue
+        out.append(strip_mem_comments(line))
+    return "\n".join(out)
+
+
+def _fold_view(text: str, key: str, hard_budget: int) -> str:
+    """按 ``## `` 分组折叠：每段保留最新一条，其余只留计数提示。"""
+    lines = text.splitlines()
+    entries = parse_entries(text)
+    by_start = {entry.start: entry for entry in entries}
+    in_block: set[int] = set()
+    for entry in entries:
+        in_block.update(range(entry.start, entry.end))
+
+    sections: dict[str | None, list[Entry]] = {}
+    for entry in entries:
+        sections.setdefault(entry.section, []).append(entry)
+    kept: set[int] = set()
+    for members in sections.values():
+        kept.add(
+            max(
+                members,
+                key=lambda entry: ((entry.mem or {}).get("touched", ""), entry.start),
+            ).start
+        )
+
+    out: list[str] = []
+    omitted = 0
+    for index, line in enumerate(lines):
+        entry = by_start.get(index)
+        if line.startswith("## "):
+            if omitted:
+                out.append(_counter_note(key, omitted))
+                omitted = 0
+            out.append(strip_mem_comments(line))
+            continue
+        if entry is not None:
+            if entry.start in kept:
+                out.append(strip_mem_comments(entry.bullet))
+            else:
+                omitted += 1
+            continue
+        if index in in_block or MEM_COMMENT_LINE_RE.match(line):
+            continue
+        out.append(strip_mem_comments(line))
+    if omitted:
+        out.append(_counter_note(key, omitted))
+
+    collapsed: list[str] = []
+    for line in out:
+        if not line.strip() and collapsed and not collapsed[-1].strip():
+            continue
+        collapsed.append(line)
+    return _head_within("\n".join(collapsed), hard_budget)
+
+
+def inject_view(text: str | None, key: str, hard_budget: int) -> str:
+    """注入 system prompt 的视图：去 mem 注释；超 hard 时逐级折叠。
+
+    纯函数，不碰磁盘；M6 的上下文包可以直接复用。
+    """
+    if not text:
+        return text or ""
+    visible = strip_mem_comments(text)
+    if _tokens(visible) <= hard_budget:
+        return text if visible == text else visible
+    if key not in ENTRY_FILES:
+        return _head_within(visible, hard_budget)
+    compact = _compact_view(text)
+    if _tokens(compact) <= hard_budget:
+        return compact
+    return _fold_view(text, key, hard_budget)
 
 
 def build_index(
@@ -469,12 +871,17 @@ def plan_update(root: Path, args: dict[str, Any]) -> MemoryPlan:
 
     target_before = live[key]
     target_text = _ensure_header(target_before, key)
+    archive_ids = entry_ids(archives[key])
+    # 先给现有条目补 id：supersede 搬进 archive 的旧块也要带 id。
+    stamped_before, _ = stamp_entries(
+        target_text, target_before, key, archive_ids=archive_ids
+    )
     new_archives = dict(archives)
     archive_before: str | None = None
     archive_after: str | None = None
 
     if action == "supersede":
-        old = _match_supersede(target_text, supersedes or "", section)
+        old = _match_supersede(stamped_before, supersedes or "", section)
         new_block = [
             f"- {entry_text}",
             f"  supersedes: {old.bullet}",  # 永远取文件里的原行
@@ -482,11 +889,14 @@ def plan_update(root: Path, args: dict[str, Any]) -> MemoryPlan:
         ]
         # section 只用于查找消歧；落点永远跟随旧条目的分组。
         target_section = old.section
-        target_text = _remove_entry(target_text, old)
+        target_text = _remove_entry(stamped_before, old)
         if target_section is None:
             target_after = _insert_block_at(target_text, old.start, new_block)
         else:
             target_after = _append_block(target_text, new_block, target_section)
+        target_after, _ = stamp_entries(
+            target_after, stamped_before, key, archive_ids=archive_ids
+        )
 
         archive_before = archives[key]
         archive_text = _ensure_header(archive_before, key, archive=True)
@@ -501,7 +911,10 @@ def plan_update(root: Path, args: dict[str, Any]) -> MemoryPlan:
             f"- {entry_text}",
             *[f"  {line}" for line in details],
         ]
-        target_after = _append_block(target_text, new_block, section)
+        target_after = _append_block(stamped_before, new_block, section)
+        target_after, _ = stamp_entries(
+            target_after, stamped_before, key, archive_ids=archive_ids
+        )
 
     new_live = dict(live)
     new_live[key] = target_after
@@ -592,20 +1005,24 @@ def format_plan(plan: MemoryPlan) -> str:
     return "\n\n".join(chunks) if chunks else "no changes"
 
 
-def _write_change(change: FileChange) -> None:
-    change.path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = change.path.with_name(change.path.name + ".keeper-tmp")
+def atomic_write(path: Path, text: str) -> None:
+    """同目录临时文件 + flush + os.replace；newline="" 保留 CRLF。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".keeper-tmp")
     try:
-        # newline=""：写入时不翻译换行，CRLF 保持 CRLF。
         with tmp.open("w", encoding="utf-8", newline="") as fh:
-            fh.write(change.after)
-        os.replace(tmp, change.path)
+            fh.write(text)
+        os.replace(tmp, path)
     finally:
         if tmp.exists():
             try:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def _write_change(change: FileChange) -> None:
+    atomic_write(change.path, change.after)
 
 
 def apply_plan(plan: MemoryPlan) -> ApplyResult:
@@ -643,8 +1060,11 @@ def _render_memory(root: Path) -> str:
             )
             continue
         if text and text.strip():
+            view = inject_view(text, key, FILE_BUDGETS[key]["hard"])
+            if not view or not view.strip():
+                continue
             # 只去掉首尾换行，保留第一行可能存在的缩进。
-            body = text.strip("\r\n")
+            body = view.strip("\r\n")
             parts.append(f"{MEMORY_SECTION_PREFIX}{name}\n\n{body}")
     if not parts:
         return ""
@@ -660,3 +1080,10 @@ def render_memory(root: Path) -> str:
             "# 项目记忆（启动时注入）\n\n"
             f"(memory: 读取失败: {type(exc).__name__}: {exc})\n"
         )
+
+
+# 供 tidy 模块复用的文本工具（名字不带下划线，避免跨模块引用私有实现）。
+detect_newline = _detect_newline
+ensure_header = _ensure_header
+insert_block_at = _insert_block_at
+rewrap = _rewrap

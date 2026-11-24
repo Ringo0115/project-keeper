@@ -27,6 +27,7 @@ class Config:
     context_window: int = DEFAULT_CONTEXT_WINDOW
     reserve_tokens: int = DEFAULT_RESERVE_TOKENS
     keep_tokens: int = DEFAULT_KEEP_TOKENS
+    memory_auto: bool = True
 
 
 def _int_env(name: str, default: int) -> int:
@@ -49,6 +50,18 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"0", "false", "off", "no"}:
+        return False
+    if value in {"1", "true", "on", "yes"}:
+        return True
+    return default
+
+
 def load_config(*, model: str | None = None, max_steps: int | None = None) -> Config:
     """优先级：显式参数 > 环境变量 > 默认值。"""
     load_dotenv()
@@ -62,6 +75,7 @@ def load_config(*, model: str | None = None, max_steps: int | None = None) -> Co
     context_window = _int_env("KEEPER_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)
     reserve_tokens = _int_env("KEEPER_RESERVE_TOKENS", DEFAULT_RESERVE_TOKENS)
     keep_tokens = _int_env("KEEPER_KEEP_TOKENS", DEFAULT_KEEP_TOKENS)
+    memory_auto = _bool_env("KEEPER_MEMORY_AUTO", True)
     return Config(
         base_url=base_url,
         api_key=api_key,
@@ -71,4 +85,5 @@ def load_config(*, model: str | None = None, max_steps: int | None = None) -> Co
         context_window=max(context_window, 1),
         reserve_tokens=max(reserve_tokens, 0),
         keep_tokens=max(keep_tokens, 1),
+        memory_auto=memory_auto,
     )

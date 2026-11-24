@@ -93,10 +93,27 @@ class UpdateMemoryTool(Tool):
         if not plan.changes:
             return ToolResult(ok=True, content="memory unchanged")
 
+        # 局部导入：切断 keeper.tidy -> keeper.tools 包初始化
+        # -> keeper.tools.memory -> keeper.tidy 的循环导入。
+        # 失败推迟到执行期是故意的：execute 永不抛异常。
+        try:
+            from keeper.tidy import TidyLock
+        except Exception as exc:
+            return error(
+                f"cannot initialize memory lock: {type(exc).__name__}: {exc}"
+            )
+        lock = TidyLock(self.root)
+        if not lock.acquire():
+            return error(
+                "memory is being tidied; retry after it finishes "
+                "(the tidy pass holds the same lock)"
+            )
         try:
             result = apply_plan(plan)
         except Exception as exc:  # 兜底：execute 永不抛异常
             return error(f"memory write crashed: {type(exc).__name__}: {exc}")
+        finally:
+            lock.release()
         if result.failed is not None:
             written = ", ".join(_label(c.path) for c in result.written) or "(none)"
             not_written = (
