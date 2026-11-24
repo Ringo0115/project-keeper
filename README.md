@@ -3,20 +3,21 @@
 > CLI 命令：`keeper`
 
 给一个本地项目配一个「长期在岗」的 AI 管家：跨会话记住项目的状态、决策和踩过的坑；
-任务开始前把记忆装进上下文，任务结束后在人工审批下更新记忆。
+任务开始前把记忆装进上下文，任务结束后自动整理记忆：人工写入需审批，自动整理可回滚地合并 / 归档。
 
-当前进度：**M0–M4 已完成；下一步 M5 可观测 / eval**。
+当前进度：**M0–M5.1a 已完成；下一步 M5.1b 治理增强，之后 M6 项目上下文层与任务路由**。
 
 ## 为什么做
 
 通用 coding agent 每次会话都从零开始，但项目状态、决策和教训属于代码库，不属于某次对话。
-keeper 把这些内容写成可读、可 diff、可手改的 Markdown，并且所有写入都必须经过人审。
+keeper 把这些内容写成可读、可 diff、可手改的 Markdown：人工写入必须经过人审，自动整理靠备份 + id 守恒可回滚。
 
 ## 能力
 
 - **项目记忆**：`.agent/memory/` 下的 Markdown；跨会话注入；替换不丢历史。
+- **记忆治理**：条目 id、soft / hard 预算、注入折叠；会话结束自动整理，备份 + id 守恒可回滚。
 - **工具循环**：读文件、列目录、搜索、写文件、受限 shell。
-- **人审边界**：写入 / 执行展示 diff 或命令，终端确认；拒绝后不执行。
+- **人审边界**：写入 / 执行展示 diff 或命令，终端确认；拒绝后不执行。自动整理不逐条确认，走备份 + 守恒。
 - **会话续跑**：JSONL 只追加，`--resume` 继续上次会话。
 - **上下文压缩**：接近窗口上限时摘要旧前缀；JSONL 追加 `compaction`，`--resume` 可重建。
 - **持久任务队列**：`.agent/tasks.json`；跨进程中断恢复；完成 / 阻塞必须显式标记。
@@ -45,6 +46,7 @@ python -m keeper "看看项目里有哪些文件"
 | `KEEPER_CONTEXT_WINDOW` | `65536` | 模型上下文窗口（tokens） |
 | `KEEPER_RESERVE_TOKENS` | `16384` | 为响应预留的 tokens；超过窗口减预留值就压缩 |
 | `KEEPER_KEEP_TOKENS` | `20000` | 压缩时尽量保留的最近 tokens |
+| `KEEPER_MEMORY_AUTO` | 开 | 会话 / task 结束后自动整理记忆；`0` / `false` / `off` / `no` 关闭 |
 
 ## 工具与审批
 
@@ -63,6 +65,7 @@ python -m keeper "看看项目里有哪些文件"
 
 所有路径限制在项目根目录内；`write_file` 拒绝写入 `.git/` 和 `.agent/`；
 `update_memory` 是 `.agent/memory/` 的写入入口，拒绝后文件字节不变。
+`update_memory` 与自动整理共用同一把单飞锁；整理进行中的人工记忆写入会返回明确错误，不会静默覆盖。
 
 ## 项目记忆
 
@@ -76,9 +79,34 @@ python -m keeper "看看项目里有哪些文件"
 | `INDEX.md` | 导航，自动生成，不手改 |
 | `*_ARCHIVE.md` | 被取代的条目，保留不删除 |
 
+`*_ARCHIVE.md` 只允许追加；整理不会删除归档条目，备份里已有的归档 id 被删会从备份恢复。
+整理规则：只归档「不再为真 / 不再有效」的条目，不按年龄、不因超预算归档。
+
 一条 entry 是一个 `- ` bullet；细节缩进；`## ` 是主题分组。
+每条 entry 的 bullet 下附一行 `<!--mem id:… created:… touched:…-->`；id 由内容派生，已有条目不重写 id，内容变化只更新 `touched`。注释在注入前剥离，不占上下文；id 用于整理前后的守恒校验，重复 id 的第二条会换新 id。
 替换旧条目时，旧条目原样移入 archive，新条目写 `supersedes: <旧 bullet 原文>`。
 启动注入顺序：`DECISIONS → LESSONS → INDEX → PROJECT_STATE`。
+
+预算按「UTF-8 字节数 / 3」计，计入 bullet 与缩进细节，不含 mem 注释和 archive：
+
+| 文件 | soft | hard |
+|---|---|---|
+| `DECISIONS.md` | 3000 | 4500 |
+| `LESSONS.md` | 2500 | 4000 |
+| `PROJECT_STATE.md` | 1200 | 1800 |
+| `INDEX.md` | 600 | 900 |
+
+超过 hard 时，注入视图先丢掉缩进细节；仍超限则按 `## ` 分组折叠（每组保留 `touched` 最新一条并标出省略数），最后头部截断。文件本身不会因为超预算被改写。预算数值尚未用产品级记忆校准，可按 `tidy-run.json` 的前后计数调整。
+
+自动整理在一次性 chat、REPL 的 `/exit` / `/quit` / EOF、task attempt 正常结束后触发；Ctrl+C 不触发。启动时只做廉价的 due 检查并提示，只读 state、文件指纹和记忆文本，不读会话、不调用模型。闸门是「超 soft + 内容有变化 + 30 分钟冷却 + 单飞锁」，不满足就不调用模型。默认开启、同步执行，退出可能因此多等一会儿；`KEEPER_MEMORY_AUTO=0` 或 `--no-tidy` 可关闭。整理只在 keeper 自身命令边界触发，没有定时器或后台进程。
+
+安全网：整理前把 live + archive + INDEX 备份到 `backups/tidy-<ts>/`（保留 5 份），备份失败不编辑；规则要求只 live→archive、不删除，代码对 `DECISIONS` / `LESSONS` 做 id 严格守恒（`PROJECT_STATE` 不套），丢失条目从备份恢复；INDEX 重建，结果写入 `tidy-run.json`。整理员还可读取最近 3 个会话作为证据（只在备份成功后读取，最多约 3000 字符），但证据也是提示词级约束。
+整理 pass 只使用 `memory_read` / `memory_write`，只改 `.agent/memory/` 下的 Markdown，不改任务队列，也不改会话文件；写入由只对 `.agent/memory/` 生效的独立审批器放行（不弹 `[y/N]`，不能写 INDEX）；单轮最多 8 次工具调用、600 秒，超时或模型失败仍写 run record。
+报告包含 tokens / 条目数前后、归档 / 合并 / 恢复计数和 evidence / cited 会话数；`evidence_sessions` / `cited_sessions` 只存会话 id，不存会话原文。自动整理失败只打 warning，不改变原命令退出码。
+
+会话证据只读 `.agent/sessions/` 下平铺的 `<id>.jsonl`，刚结束的会话优先，其余按最近活动倒序；坏行、半行和非法字段跳过，超过 1 MiB 只读尾部。读取不写盘、不建目录、不碰锁。
+
+`keeper memory tidy` 是强制 / 调试入口（跳过 due 闸门，仍备份 / 守恒）；`keeper memory tidy --check` 只读查看 due、预算、锁和上次报告，不需要 API key。`pinned` 和「合并只缩不加」目前仍是提示词规则，不是代码硬校验；整理只改磁盘，当前会话的 system prompt 是启动快照，结果下次启动才生效。
 
 ## 上下文压缩（M4）
 
@@ -104,12 +132,22 @@ keeper task add "修复 login 测试"     # 入队，stdout 输出 task id
 keeper task list                     # 查看队列；会先做一次启动恢复
 keeper task run                      # 跑队首 queued 任务（一次一个 attempt）
 keeper task run t-20261122-153012-a1b2c3
+
+keeper memory tidy                   # 强制整理一次（仍备份 / 守恒）
+keeper memory tidy --check           # 只读查看 due / 预算 / 锁 / 上次报告
+keeper memory tidy --root ../other-project  # 对另一个项目强制整理
 ```
+
+`keeper --no-tidy` / `keeper task run --no-tidy` 只关闭本次结束后的自动整理。
 
 ## 数据落在哪
 
 目标项目的 `.agent/`：会话 JSONL 只追加；记忆在 `.agent/memory/`；
 任务队列在 `.agent/tasks.json`（原子写）；M4 的 `compaction` 记录也追加在会话 JSONL 里，旧消息不删。
+
+整理另在 `.agent/memory/` 下产生 `backups/tidy-<ts>/`（保留 5 份）、`tidy-run.json`（最近一次结果）、
+`.tidy-state.json`（文件指纹与冷却水位）和 `.tidy.lock`（单飞锁）。记忆文件用 tmp + `os.replace` 原子写。
+`.tidy-state.json` 还记录 `last_attempt_at` / `last_success_at`；`.tidy.lock` 含 pid + host，死进程或锁龄超过 2 小时可回收。
 
 ## 路线
 
@@ -118,9 +156,11 @@ keeper task run t-20261122-153012-a1b2c3
 - **M2 记忆**：已完成。
 - **M3 任务队列**：已完成；持久任务、中断恢复、显式完成 / 阻塞。
 - **M4 最小压缩**：已完成；阈值 + 安全切点 + 六段摘要 + JSONL `compaction`。
-- **M5 可观测 / eval**：本地 trace + 固定样本。
+- **M5 记忆治理**：M5.0 自动整理（id、预算、折叠、备份、守恒）与 M5.1a 会话证据已完成；M5.1b 治理增强（pinned、checkpoint、自适应冷却、后台执行、预算缩放）是下一步。
+- **M6 项目上下文层与任务路由**：项目注册表、worker 适配、收件箱、映射优先 + 模型兜底、飞书来源（前台 `keeper watch`，不是服务端）。
+- **M7 可观测 / eval**：本地 trace + 固定样本 + 量化指标。
 
-不做：Web UI、多 agent、触发器、Skills、OS 沙箱、RAG / 向量库。
+不做：Web UI、后台常驻服务 / installer、内部子 agent 编排、外部事件触发器、Skills、OS 沙箱、RAG / 向量库、分支摘要 / 插件钩子 / TUI 流式、多 provider 适配层。
 
 ## 开发
 
