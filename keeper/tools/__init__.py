@@ -1,6 +1,7 @@
 """工具层。"""
 
 from keeper.tools.base import Tool, ToolResult, error
+from keeper.tools.checkpoint import RequestCheckpointTool
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
 from keeper.tools.memory import UpdateMemoryTool
 from keeper.tools.registry import Registry
@@ -15,6 +16,7 @@ __all__ = [
     "WriteFileTool",
     "SearchTool",
     "UpdateMemoryTool",
+    "RequestCheckpointTool",
     "ShellTool",
     "Registry",
 ]

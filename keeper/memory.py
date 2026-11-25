@@ -27,7 +27,13 @@ MEMORY_SECTION_PREFIX = "## 项目记忆 / "
 # 注入前由 inject_view 剥离，不占预算。
 MEM_COMMENT_RE = re.compile(r"<!--mem\s+(?P<body>.*?)-->")
 MEM_COMMENT_LINE_RE = re.compile(r"^\s*<!--mem\s+.*?-->\s*$")
-MEM_FIELD_ORDER = ("id", "created", "touched")
+MEM_FIELD_ORDER = ("id", "created", "touched", "pinned")
+
+# pinned 是代码级保护（M5.1b），不是提示词建议：带这个字段的条目在整理
+# 后被改 / 移 / 删 / 转档，postpass 会从备份回滚。手工写 `pinned:1` 即可；
+# 没有该字段的旧记录一律按未 pinned 处理。
+PINNED_FIELD = "pinned"
+PINNED_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "pinned"})
 
 # 预算口径：UTF-8 字节 // 3。计入 bullet 与缩进细节，不含 mem 注释和
 # archive；INDEX 是导航文件，单独给一档。
@@ -37,6 +43,12 @@ FILE_BUDGETS: dict[str, dict[str, int]] = {
     "project_state": {"soft": 1200, "hard": 1800},
     "index": {"soft": 600, "hard": 900},
 }
+
+# 预算按 worker 的上下文窗口缩放（M5.1b）：默认窗口下就是上表；更小的窗口
+# 收紧预算，更大的窗口最多放大 2 倍。只缩放 soft / hard，不改预算口径。
+MEMORY_BUDGET_WINDOW = 65536
+BUDGET_SCALE_MIN = 0.5
+BUDGET_SCALE_MAX = 2.0
 
 _LEAD_DATE_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?[:：]?\s*")
 
@@ -90,6 +102,14 @@ class Entry:
             for index, line in enumerate(self.lines)
             if index > 0 and index != self.mem_index
         )
+
+
+def is_pinned(entry: Entry) -> bool:
+    """``<!--mem ... pinned:1-->`` 才是 pinned；缺字段按未 pinned。"""
+    if not entry.mem:
+        return False
+    value = entry.mem.get(PINNED_FIELD, "")
+    return value.strip().lower() in PINNED_TRUE_VALUES
 
 
 @dataclass(frozen=True)
@@ -487,11 +507,15 @@ def stamp_entries(
         else:
             for candidate in old_by_key.get(_bullet_key(entry), ()):
                 candidate_id = candidate.mem.get("id") if candidate.mem else None
-                if (
-                    id(candidate) in claimed
-                    or not candidate_id
-                    or candidate_id in used
+                if id(candidate) in claimed or (
+                    candidate_id and candidate_id in used
                 ):
+                    continue
+                # 手写的 pinned 条目可能还没有 id；保留它的 pinned 字段，
+                # 下面再补一个新 id。普通的无 id 条目不用这个回退。
+                if candidate_id is None and not (
+                    candidate.mem or {}
+                ).get(PINNED_FIELD):
                     continue
                 fields = dict(candidate.mem or {})
                 claimed.add(id(candidate))
@@ -500,7 +524,11 @@ def stamp_entries(
                 break
 
         if fields is None:
-            fields = {"id": new_entry_id(_entry_title(entry), taken | used)}
+            # 没有 id 的条目（例如手写 pinned）保留自己的字段；已有 id 但
+            # 找不到旧条目时视为重复 / 失配，必须换新 id。
+            fields = dict(entry.mem or {}) if not own_id else {}
+        if "id" not in fields:
+            fields["id"] = new_entry_id(_entry_title(entry), taken | used)
         fields.setdefault("created", today)
         fields.setdefault("touched", fields["created"])
         used.add(fields["id"])
@@ -524,7 +552,12 @@ def stamp_entries(
             continue
         out.extend(rendered[entry.start])
         index = entry.end
-    return _join(out, _detect_newline(new_text)), warnings
+    result = _join(out, _detect_newline(new_text))
+    # 原文件没有终止换行时保持原样；否则 only-touched 的 stamp 会给未编辑
+    # 文件凭空加一个换行（M5.1b 的 pinned 严格字节回归会因此失败）。
+    if new_text and not new_text.endswith(("\n", "\r")):
+        result = result.rstrip("\r\n")
+    return result, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -558,13 +591,53 @@ def memory_tokens(text: str | None) -> int:
     return _tokens(strip_mem_comments(text))
 
 
-def over_soft_budget(text: str | None, key: str) -> bool:
-    budgets = FILE_BUDGETS.get(key)
+def budget_scale(context_window: int | None) -> float:
+    """窗口相对默认窗口的缩放系数；None / 非法值按默认窗口（1.0）。"""
+    try:
+        window = int(context_window) if context_window is not None else 0
+    except (TypeError, ValueError):
+        return 1.0
+    if window <= 0:
+        return 1.0
+    return min(
+        max(window / MEMORY_BUDGET_WINDOW, BUDGET_SCALE_MIN),
+        BUDGET_SCALE_MAX,
+    )
+
+
+def effective_budgets(
+    context_window: int | None = None,
+) -> dict[str, dict[str, int]]:
+    """按 worker 窗口缩放后的 soft / hard 预算；default 窗口等于原表。"""
+    scale = budget_scale(context_window)
+    out: dict[str, dict[str, int]] = {}
+    for key, budget in FILE_BUDGETS.items():
+        if scale == 1.0:
+            out[key] = dict(budget)
+            continue
+        soft = max(1, round(budget["soft"] * scale))
+        hard = max(soft + 1, round(budget["hard"] * scale))
+        out[key] = {"soft": soft, "hard": hard}
+    return out
+
+
+def file_budget(
+    key: str, context_window: int | None = None
+) -> dict[str, int] | None:
+    return effective_budgets(context_window).get(key)
+
+
+def over_soft_budget(
+    text: str | None, key: str, context_window: int | None = None
+) -> bool:
+    budgets = file_budget(key, context_window)
     return bool(budgets) and memory_tokens(text) > budgets["soft"]
 
 
-def over_hard_budget(text: str | None, key: str) -> bool:
-    budgets = FILE_BUDGETS.get(key)
+def over_hard_budget(
+    text: str | None, key: str, context_window: int | None = None
+) -> bool:
+    budgets = file_budget(key, context_window)
     return bool(budgets) and memory_tokens(text) > budgets["hard"]
 
 
@@ -1047,8 +1120,9 @@ def apply_plan(plan: MemoryPlan) -> ApplyResult:
 # ---------------------------------------------------------------------------
 
 
-def _render_memory(root: Path) -> str:
+def _render_memory(root: Path, context_window: int | None = None) -> str:
     parts: list[str] = []
+    budgets = effective_budgets(context_window)
     for key in INJECTION_ORDER:
         name = FILE_NAMES[key]
         try:
@@ -1060,7 +1134,7 @@ def _render_memory(root: Path) -> str:
             )
             continue
         if text and text.strip():
-            view = inject_view(text, key, FILE_BUDGETS[key]["hard"])
+            view = inject_view(text, key, budgets[key]["hard"])
             if not view or not view.strip():
                 continue
             # 只去掉首尾换行，保留第一行可能存在的缩进。
@@ -1071,10 +1145,13 @@ def _render_memory(root: Path) -> str:
     return "# 项目记忆（启动时注入）\n\n" + "\n\n".join(parts) + "\n"
 
 
-def render_memory(root: Path) -> str:
-    """启动注入文本：DECISIONS -> LESSONS -> INDEX -> PROJECT_STATE。"""
+def render_memory(root: Path, context_window: int | None = None) -> str:
+    """启动注入文本：DECISIONS -> LESSONS -> INDEX -> PROJECT_STATE。
+
+    ``context_window`` 为当前 worker 的窗口；None 保持默认预算（旧行为）。
+    """
     try:
-        return _render_memory(root)
+        return _render_memory(root, context_window=context_window)
     except Exception as exc:
         return (
             "# 项目记忆（启动时注入）\n\n"
@@ -1086,4 +1163,5 @@ def render_memory(root: Path) -> str:
 detect_newline = _detect_newline
 ensure_header = _ensure_header
 insert_block_at = _insert_block_at
+remove_entry = _remove_entry
 rewrap = _rewrap

@@ -32,7 +32,11 @@ def _task_block(task: TaskContext) -> str:
 - 完成或阻塞后直接给出简短回答，不要再调用其他工具。"""
 
 
-def system_prompt(root: Path, task: TaskContext | None = None) -> str:
+def system_prompt(
+    root: Path,
+    task: TaskContext | None = None,
+    context_window: int | None = None,
+) -> str:
     base = f"""你是 keeper，一个在本地项目里干活的 CLI agent。
 
 项目根目录：{root}
@@ -41,6 +45,7 @@ def system_prompt(root: Path, task: TaskContext | None = None) -> str:
 - read_file / list_dir / search：只读，直接执行。
 - write_file：新建或覆盖项目文件，执行前需要用户确认。
 - update_memory：提议更新项目记忆（decisions / lessons / project_state）；写入前展示 diff 并请求确认。
+- request_memory_checkpoint：请求在本次会话结束后的 CLI 边界整理记忆；只写请求标记，不立即整理，也不绕过 due 闸门。
 - shell：执行受限命令（argv 数组、命令白名单、固定项目根目录），执行前需要用户确认。
 
 工作方式：
@@ -64,7 +69,7 @@ def system_prompt(root: Path, task: TaskContext | None = None) -> str:
 
     # 记忆块必须留在最后：PROJECT_STATE 是注入顺序的最后一项。
     # 任务块只在任务模式下追加在记忆之后；默认 None 时字节不变。
-    memory = render_memory(root)
+    memory = render_memory(root, context_window=context_window)
     if task is None:
         if memory:
             return base.rstrip() + "\n\n" + memory

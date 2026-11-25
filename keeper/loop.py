@@ -88,7 +88,7 @@ class AgentLoop:
         self.llm = llm
         self.registry = registry
         self.session = session
-        self.system = system_prompt(root, task)
+        self.system = system_prompt(root, task, context_window=context_window)
         self.max_steps = max_steps
         self.root = Path(root).resolve()
         self.approver = approver

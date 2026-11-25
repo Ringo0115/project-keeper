@@ -35,6 +35,7 @@ from keeper.session import Session
 from keeper.task_runner import TaskRunError, prepare_task_run, run_task_once
 from keeper.tasks import Task, TaskStore, TaskStoreError
 from keeper.tidy import check_due, format_check, read_run_record, run_tidy
+from keeper.tools.checkpoint import RequestCheckpointTool
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
 from keeper.tools.memory import UpdateMemoryTool
 from keeper.tools.registry import Registry
@@ -118,6 +119,7 @@ def _build_registry(root: Path) -> Registry:
             WriteFileTool(root),
             SearchTool(root),
             UpdateMemoryTool(root),
+            RequestCheckpointTool(root),
             ShellTool(root),
         ]
     )
@@ -365,7 +367,9 @@ def _task_main(argv: list[str]) -> int:
         return 2
 
     no_tidy = args.no_tidy
-    _startup_tidy_hint(root, _tidy_enabled(config, no_tidy))
+    _startup_tidy_hint(
+        root, _tidy_enabled(config, no_tidy), config.context_window
+    )
 
     if args.id:
         task = store.get(args.id)
@@ -411,16 +415,18 @@ def _memory_main(argv: list[str]) -> int:
         action="store_true",
         help="只读查看 due / 预算 / 上次报告，不整理",
     )
-
     args = parser.parse_args(argv)
     root = args.root.expanduser().resolve()
     if not root.is_dir():
         print(f"error: root is not a directory: {root}", file=sys.stderr)
         return 2
 
+    config = load_config(model=args.model)
+    context_window = config.context_window
+
     if args.check:
         try:
-            decision = check_due(root)
+            decision = check_due(root, context_window=context_window)
             report = read_run_record(root)
         except Exception as exc:
             print(
@@ -428,10 +434,9 @@ def _memory_main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 2
-        print(format_check(root, decision, report))
+        print(format_check(root, decision, report, context_window))
         return 0
 
-    config = load_config(model=args.model)
     if not config.api_key:
         print(_api_key_error(), file=sys.stderr)
         return 2
@@ -443,7 +448,9 @@ def _memory_main(argv: list[str]) -> int:
         temperature=config.temperature,
     )
     try:
-        report = run_tidy(root, llm, force=True, trigger="manual")
+        report = run_tidy(
+            root, llm, force=True, trigger="manual", context_window=context_window
+        )
     except Exception as exc:
         print(
             f"error: tidy failed: {type(exc).__name__}: {exc}",
@@ -473,12 +480,14 @@ def _tidy_enabled(config: Config, no_tidy: bool) -> bool:
     return config.memory_auto and not no_tidy
 
 
-def _startup_tidy_hint(root: Path, enabled: bool) -> None:
+def _startup_tidy_hint(
+    root: Path, enabled: bool, context_window: int | None = None
+) -> None:
     """启动时的廉价 due 检查：只读、只提示，不同步整理、不调用 LLM。"""
     if not enabled:
         return
     try:
-        decision = check_due(root)
+        decision = check_due(root, context_window=context_window)
     except Exception:
         return
     if decision.due:
@@ -494,12 +503,21 @@ def _maybe_auto_tidy(
     no_tidy: bool = False,
     session_id: str | None = None,
 ) -> None:
-    """会话 / attempt 正常结束后同步整理；任何失败都只提示，不改退出码。"""
+    """会话 / attempt 正常结束后同步整理；任何失败都只提示，不改退出码。
+
+    跨 CLI 的“整理不抢占其它会话”仍没有可靠的低成本准入机制，所以这里
+    保持同步：只在本进程的 CLI 边界跑，不拉起后台进程。
+    """
     if not _tidy_enabled(config, no_tidy):
         return
     try:
         report = run_tidy(
-            root, llm, force=False, trigger=trigger, session_id=session_id
+            root,
+            llm,
+            force=False,
+            trigger=trigger,
+            session_id=session_id,
+            context_window=config.context_window,
         )
     except Exception as exc:
         print(
@@ -549,7 +567,9 @@ def _chat_main(argv: list[str]) -> int:
         return 2
 
     no_tidy = args.no_tidy
-    _startup_tidy_hint(root, _tidy_enabled(config, no_tidy))
+    _startup_tidy_hint(
+        root, _tidy_enabled(config, no_tidy), config.context_window
+    )
 
     # --resume 先读 task 再读 session：恢复后若有 queued 任务，跑队首任务。
     if args.resume:

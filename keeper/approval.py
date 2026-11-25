@@ -73,6 +73,11 @@ def review(
         # danger="task" 是语义标记；若走到下面的通用映射，未知 danger 仍会 DENY。
         return Review(decision=Decision.ALLOW, summary=summary)
 
+    if tool_name == "request_memory_checkpoint":
+        # 只写 .agent/memory/.tidy-request.json 请求标记；不整理、不写记忆。
+        # 标记本身不改变任何记忆字节，真正整理仍走 due 闸门与备份。
+        return Review(decision=Decision.ALLOW, summary=summary)
+
     if tool_name == "update_memory":
         # 预览与执行共用同一份纯规划；非法参数直接拒绝，不弹审批。
         try:
