@@ -89,6 +89,9 @@ def prepare_task_run(
         session.close()
         raise
 
+    # start_attempt 在锁内重载了队列，旧对象已过期；attempt_number 要用新对象数。
+    task = store.get(task.id) or task
+
     message = f"[task {task.id}] {task.title}"
     if resumed:
         message += (
@@ -262,19 +265,26 @@ def _since_for_worker(task: Task, worker_slug: str) -> str | None:
 
 
 def _finish_from_record(
-    store: TaskStore, task_id: str, record: CompletionRecord
+    store: TaskStore, task_id: str, record: CompletionRecord, session_id: str | None = None
 ) -> None:
-    """沿用 R4 的完成判定，只决定队列状态；不新增判定规则。"""
+    """沿用 R4 的完成判定，只决定队列状态；不新增判定规则。
+
+    session_id 必须显式传下去：收尾在锁内重载队列，锁外挂着的旧 attempt
+    对象已经过期，靠它补 session_id 会被重载冲掉。
+    """
     if record.result == "done":
-        store.complete(task_id, summary=record.summary, transcript=record.transcript)
+        store.complete(task_id, summary=record.summary, transcript=record.transcript,
+                       session_id=session_id)
     elif record.result == "blocked":
-        store.block(task_id, record.summary, transcript=record.transcript)
+        store.block(task_id, record.summary, transcript=record.transcript,
+                    session_id=session_id)
     else:
         store.fail(
             task_id,
             record.summary,
             result=record.result,
             transcript=record.transcript,
+            session_id=session_id,
         )
 
 
@@ -344,9 +354,10 @@ def run_task_worker(
         since=since,
         session_path=session_path,
     )
-    if attempt.session_id is None and record.transcript:
+    resolved_session = attempt.session_id
+    if resolved_session is None and record.transcript:
         candidate = Path(record.transcript)
         if candidate.parent == Path(project.root).resolve() / SESSIONS_DIR:
-            attempt.session_id = candidate.stem
-    _finish_from_record(store, task_id, record)
+            resolved_session = candidate.stem
+    _finish_from_record(store, task_id, record, session_id=resolved_session)
     return record

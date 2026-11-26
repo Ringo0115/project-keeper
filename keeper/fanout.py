@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -72,6 +73,9 @@ class FanoutBatch:
         self.resolve_reason = resolve_reason
         self.created_at = created_at or _now()
         self.resolved_at = resolved_at
+        # ThreadPoolExecutor 的多个线程会并发 absorb；读-改-写必须串行。
+        # RLock：absorb 内部可重入调用 resolve / _write。
+        self._lock = threading.RLock()
 
     # ---------- 构造与读取 ----------
 
@@ -116,35 +120,38 @@ class FanoutBatch:
         与 Orbital 的 ``absorb_terminal`` 一致：幂等，且最后一个任务落地
         时整组收尾一次（``resolved`` 之后再来的事件一律忽略）。
         """
-        if self.status != "running":
-            return False
-        task = self.get(label)
-        if task is None or task.status in TERMINAL:
-            return False
-        task.status = status
-        task.summary = summary
-        task.transcript = transcript or task.transcript
-        task.ended_at = _now()
-        if self.all_terminal:
-            self.resolve("all_terminal")
-        else:
-            self._write()
-        return True
+        with self._lock:
+            # 锁内复查：等锁期间可能已有别的线程收尾。
+            if self.status != "running":
+                return False
+            task = self.get(label)
+            if task is None or task.status in TERMINAL:
+                return False
+            task.status = status
+            task.summary = summary
+            task.transcript = transcript or task.transcript
+            task.ended_at = _now()
+            if self.all_terminal:
+                self.resolve("all_terminal")
+            else:
+                self._write()
+            return True
 
     def resolve(self, reason: str) -> bool:
         """收尾整组：还没落地的一律记为 interrupted。返回是否本次收尾。"""
-        if self.status != "running":
-            return False
-        for task in self.tasks:
-            if task.status not in TERMINAL:
-                task.status = "interrupted"
-                task.summary = task.summary or f"批次收尾（{reason}），该子任务未回报"
-                task.ended_at = _now()
-        self.status = "resolved"
-        self.resolve_reason = reason
-        self.resolved_at = _now()
-        self._write()
-        return True
+        with self._lock:
+            if self.status != "running":
+                return False
+            for task in self.tasks:
+                if task.status not in TERMINAL:
+                    task.status = "interrupted"
+                    task.summary = task.summary or f"批次收尾（{reason}），该子任务未回报"
+                    task.ended_at = _now()
+            self.status = "resolved"
+            self.resolve_reason = reason
+            self.resolved_at = _now()
+            self._write()
+            return True
 
     def to_dict(self) -> dict:
         return {
@@ -158,12 +165,15 @@ class FanoutBatch:
         }
 
     def _write(self) -> None:
-        payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
-        path = self.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        with self._lock:
+            payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
+            path = self.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # 同进程多线程会同时写：pid 之外再加线程 id 和随机后缀，避免临时文件撞车。
+            unique = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+            tmp = path.with_name(f"{path.name}.tmp.{unique}")
+            with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)

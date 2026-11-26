@@ -121,5 +121,6 @@ def test_lock_busy_blocks_automatic_gate_without_llm(tmp_path, monkeypatch) -> N
     finally:
         lock.release()
 
-    assert lock_path(tmp_path).exists() is False
+    # 系统锁不删锁文件，释放后文件仍在原地，但已不再被持有
+    assert not TidyLock(tmp_path).is_locked()
     assert backup_memory(tmp_path).path is not None  # 锁释放后整理仍可备份

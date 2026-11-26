@@ -185,42 +185,28 @@ def test_lock_busy_blocks_due_and_force(tmp_path, monkeypatch) -> None:
         lock.release()
 
 
-def _write_lock(root, pid: int, host: str | None = None) -> None:
-    path = lock_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"pid": pid, "host": host or socket.gethostname()}),
-        encoding="utf-8",
-    )
-
-
-def test_stale_lock_is_reclaimed_live_lock_is_not(tmp_path) -> None:
+def test_held_lock_blocks_and_release_frees_it(tmp_path) -> None:
     _seed_over_soft(tmp_path)
 
-    _write_lock(tmp_path, 999_999_999)
-    dead = TidyLock(tmp_path)
-    assert dead.acquire()
-    dead.release()
-
-    _write_lock(tmp_path, os.getpid())
-    live = TidyLock(tmp_path)
-    assert not live.acquire()
-    lock_path(tmp_path).unlink()
+    holder = TidyLock(tmp_path)
+    assert holder.acquire()
+    contender = TidyLock(tmp_path)
+    assert not contender.acquire()
+    holder.release()
+    assert contender.acquire()
+    contender.release()
 
 
-def test_invalid_fresh_lock_is_busy_but_old_lock_is_stale(tmp_path) -> None:
+def test_lock_file_left_by_crash_does_not_block(tmp_path) -> None:
     _seed_over_soft(tmp_path)
     path = lock_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("not json", encoding="utf-8")
+    path.write_text("", encoding="utf-8")
 
-    assert not TidyLock(tmp_path, stale_seconds=3600).acquire()
-
-    old = time.time() - 10
-    os.utime(path, (old, old))
-    lock = TidyLock(tmp_path, stale_seconds=1)
+    lock = TidyLock(tmp_path)
     assert lock.acquire()
     lock.release()
+    assert path.exists()  # 系统锁不删文件，释放后仍留在原地
 
 
 def test_update_memory_is_blocked_by_tidy_lock(tmp_path) -> None:

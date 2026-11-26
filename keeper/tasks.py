@@ -5,7 +5,9 @@
 - 同一项目同时最多一个 running；状态只有 queued / running / blocked / done。
 - 每次执行追加一条 attempt；打开中的 attempt 的 ended_at / outcome 为 None。
 - 进程被 kill 时最后一次完整落盘保证是 running + open attempt，启动恢复统一收尾。
-- 不做跨进程文件锁：单用户本地 CLI，同一项目只假设一个进程在写。
+- 队列变更（add / start_attempt / retry_attempt）在「锁内重载 → 检查 → 落盘」
+  的短临界区里完成；worker 执行期间不持锁。锁是系统级文件锁（见
+  ``keeper.file_lock``），进程一死自动释放。
 """
 
 from __future__ import annotations
@@ -13,12 +15,16 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from keeper.file_lock import FileLock
 
 TASKS_FILE = Path(".agent") / "tasks.json"
+LOCK_FILE = Path(".agent") / "tasks.lock"
 VERSION = 1
 
 STATUSES = {"queued", "running", "blocked", "done"}
@@ -31,6 +37,10 @@ TERMINAL = {"blocked", "done"}
 
 class TaskStoreError(RuntimeError):
     """tasks.json 读写或状态转换失败。调用方必须明确报错，不能静默覆盖。"""
+
+
+class TaskLockError(TaskStoreError):
+    """任务队列正被另一个进程写。调用方立即失败，不等待、不重试、不排队。"""
 
 
 def now_iso() -> str:
@@ -239,6 +249,7 @@ class TaskStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
         self.path = self.root / TASKS_FILE
+        self.lock_path = self.root / LOCK_FILE
         self.tasks: list[Task] = []
 
     # ---------- 加载 / 写入 ----------
@@ -302,6 +313,27 @@ class TaskStore:
                 f"无法写入 {self.path}: {type(exc).__name__}: {exc}"
             ) from exc
 
+    # ---------- 跨进程临界区 ----------
+
+    @contextmanager
+    def locked(self) -> Iterator["TaskStore"]:
+        """持锁重载 → 交给 with 体修改并落盘 → 释放。
+
+        必须重载：调用方手里的 ``self.tasks`` 可能是锁外的旧快照，
+        直接拿它检查 / 写回会覆盖别的进程刚写进去的变更。
+        """
+        lock = FileLock(self.lock_path)
+        if not lock.acquire():
+            raise TaskLockError(
+                f"该项目任务队列正被另一个进程写入；锁文件: {self.lock_path}；"
+                "请等它结束或确认没有残留进程"
+            )
+        try:
+            self.tasks = type(self).load(self.root).tasks
+            yield self
+        finally:
+            lock.release()
+
     # ---------- 查询 ----------
 
     def get(self, task_id: str) -> Task | None:
@@ -348,91 +380,98 @@ class TaskStore:
             raise TaskStoreError("任务标题不能为空")
         if worker is not None and (not isinstance(worker, str) or not worker.strip()):
             raise TaskStoreError("worker 指派不能为空字符串")
-        now = now_iso()
-        task = Task(
-            id=_new_task_id(now),
-            title=cleaned,
-            status="queued",
-            created_at=now,
-            updated_at=now,
-            worker=worker.strip() if worker else None,
-        )
-        self.tasks.append(task)
-        self.save()
+        with self.locked():
+            now = now_iso()
+            task = Task(
+                id=_new_task_id(now),
+                title=cleaned,
+                status="queued",
+                created_at=now,
+                updated_at=now,
+                worker=worker.strip() if worker else None,
+            )
+            self.tasks.append(task)
+            self.save()
         return task
 
     def start_attempt(
         self, task_id: str, session_id: str | None, *, worker: str | None = None
     ) -> Attempt:
         """queued → running，追加一条打开中的 attempt，先落盘再跑 loop。"""
-        task = self._require(task_id)
-        if task.status != "queued":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，只有 queued 可以开始"
-            )
-        other = self.running()
-        if other is not None:
-            raise TaskStoreError(
-                f"已有 running 任务 {other.id}；同一项目同时只能有一个"
-            )
-        now = now_iso()
-        attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
-        task.attempts.append(attempt)
-        task.status = "running"
-        task.block_reason = None
-        if worker is not None:
-            task.worker = worker
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "queued":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，只有 queued 可以开始"
+                )
+            other = self.running()
+            if other is not None:
+                raise TaskStoreError(
+                    f"已有 running 任务 {other.id}；同一项目同时只能有一个"
+                )
+            now = now_iso()
+            attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
+            task.attempts.append(attempt)
+            task.status = "running"
+            task.block_reason = None
+            if worker is not None:
+                task.worker = worker
+            task.updated_at = now
+            self.save()
         return attempt
 
     def retry_attempt(
         self, task_id: str, session_id: str | None = None, *, worker: str | None = None
     ) -> Attempt:
         """blocked → running：阻塞或失败的项在新会话里重跑，可换 worker。"""
-        task = self._require(task_id)
-        if task.status != "blocked":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，"
-                "只有 blocked（阻塞或失败）可以重试"
-            )
-        other = self.running()
-        if other is not None:
-            raise TaskStoreError(
-                f"已有 running 任务 {other.id}；同一项目同时只能有一个"
-            )
-        now = now_iso()
-        attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
-        task.attempts.append(attempt)
-        task.status = "running"
-        task.block_reason = None
-        if worker is not None:
-            task.worker = worker
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "blocked":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，"
+                    "只有 blocked（阻塞或失败）可以重试"
+                )
+            other = self.running()
+            if other is not None:
+                raise TaskStoreError(
+                    f"已有 running 任务 {other.id}；同一项目同时只能有一个"
+                )
+            now = now_iso()
+            attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
+            task.attempts.append(attempt)
+            task.status = "running"
+            task.block_reason = None
+            if worker is not None:
+                task.worker = worker
+            task.updated_at = now
+            self.save()
         return attempt
 
     def complete(
-        self, task_id: str, *, summary: str | None = None, transcript: str | None = None
+        self, task_id: str, *, summary: str | None = None, transcript: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         """running → done，立即收尾，防止完成之后崩溃丢失 done。"""
-        task = self._require(task_id)
-        if task.status != "running":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，不能标记完成"
-            )
-        attempt = self._open_attempt(task)
-        now = now_iso()
-        attempt.ended_at = now
-        attempt.outcome = "done"
-        attempt.block_reason = None
-        attempt.result = "done"
-        attempt.summary = summary
-        attempt.transcript = transcript
-        task.status = "done"
-        task.block_reason = None
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "running":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，不能标记完成"
+                )
+            attempt = self._open_attempt(task)
+            now = now_iso()
+            attempt.ended_at = now
+            attempt.outcome = "done"
+            attempt.block_reason = None
+            attempt.result = "done"
+            attempt.summary = summary
+            attempt.transcript = transcript
+            if session_id is not None:
+                attempt.session_id = session_id
+            task.status = "done"
+            task.block_reason = None
+            task.updated_at = now
+            self.save()
 
     def block(
         self,
@@ -441,28 +480,32 @@ class TaskStore:
         *,
         summary: str | None = None,
         transcript: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         """running → blocked；reason 去空白后为空则拒绝，且不落盘。"""
         cleaned = reason.strip() if isinstance(reason, str) else ""
         if not cleaned:
             raise TaskStoreError("block 原因不能为空")
-        task = self._require(task_id)
-        if task.status != "running":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，不能标记阻塞"
-            )
-        attempt = self._open_attempt(task)
-        now = now_iso()
-        attempt.ended_at = now
-        attempt.outcome = "blocked"
-        attempt.block_reason = cleaned
-        attempt.result = "blocked"
-        attempt.summary = summary if summary is not None else cleaned
-        attempt.transcript = transcript
-        task.status = "blocked"
-        task.block_reason = cleaned
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "running":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，不能标记阻塞"
+                )
+            attempt = self._open_attempt(task)
+            now = now_iso()
+            attempt.ended_at = now
+            attempt.outcome = "blocked"
+            attempt.block_reason = cleaned
+            attempt.result = "blocked"
+            attempt.summary = summary if summary is not None else cleaned
+            attempt.transcript = transcript
+            if session_id is not None:
+                attempt.session_id = session_id
+            task.status = "blocked"
+            task.block_reason = cleaned
+            task.updated_at = now
+            self.save()
 
     def fail(
         self,
@@ -471,6 +514,7 @@ class TaskStore:
         *,
         result: str = "failed",
         transcript: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         """running → blocked，记录 failed / interrupted；任务可 retry。"""
         cleaned = reason.strip() if isinstance(reason, str) else ""
@@ -478,55 +522,60 @@ class TaskStore:
             raise TaskStoreError("fail 原因不能为空")
         if result not in {"failed", "interrupted"}:
             raise TaskStoreError(f"fail result={result!r} 不合法")
-        task = self._require(task_id)
-        if task.status != "running":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，不能标记失败"
-            )
-        attempt = self._open_attempt(task)
-        now = now_iso()
-        attempt.ended_at = now
-        attempt.outcome = result
-        attempt.block_reason = cleaned
-        attempt.result = result
-        attempt.summary = cleaned
-        attempt.transcript = transcript
-        task.status = "blocked"
-        task.block_reason = cleaned
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "running":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，不能标记失败"
+                )
+            attempt = self._open_attempt(task)
+            now = now_iso()
+            attempt.ended_at = now
+            attempt.outcome = result
+            attempt.block_reason = cleaned
+            attempt.result = result
+            attempt.summary = cleaned
+            attempt.transcript = transcript
+            if session_id is not None:
+                attempt.session_id = session_id
+            task.status = "blocked"
+            task.block_reason = cleaned
+            task.updated_at = now
+            self.save()
 
     def block_before_start(self, task_id: str, reason: str) -> None:
         """queued → blocked：启动前失败（例如 session 文件丢失），不产生 attempt。"""
         cleaned = reason.strip() if isinstance(reason, str) else ""
         if not cleaned:
             raise TaskStoreError("block 原因不能为空")
-        task = self._require(task_id)
-        if task.status != "queued":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，不能标记启动前失败"
-            )
-        task.status = "blocked"
-        task.block_reason = cleaned
-        task.updated_at = now_iso()
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "queued":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，不能标记启动前失败"
+                )
+            task.status = "blocked"
+            task.block_reason = cleaned
+            task.updated_at = now_iso()
+            self.save()
 
     def mark_incomplete(self, task_id: str) -> None:
         """running → queued：正常结束但没有显式 complete；任务留在原队列位置。"""
-        task = self._require(task_id)
-        if task.status != "running":
-            raise TaskStoreError(
-                f"任务 {task.id} 当前状态为 {task.status}，不能标记 incomplete"
-            )
-        attempt = self._open_attempt(task)
-        now = now_iso()
-        attempt.ended_at = now
-        attempt.outcome = "incomplete"
-        attempt.block_reason = None
-        task.status = "queued"
-        task.block_reason = None
-        task.updated_at = now
-        self.save()
+        with self.locked():
+            task = self._require(task_id)
+            if task.status != "running":
+                raise TaskStoreError(
+                    f"任务 {task.id} 当前状态为 {task.status}，不能标记 incomplete"
+                )
+            attempt = self._open_attempt(task)
+            now = now_iso()
+            attempt.ended_at = now
+            attempt.outcome = "incomplete"
+            attempt.block_reason = None
+            task.status = "queued"
+            task.block_reason = None
+            task.updated_at = now
+            self.save()
 
     # ---------- 启动恢复 ----------
 

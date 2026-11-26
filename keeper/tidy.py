@@ -12,7 +12,6 @@ import math
 import os
 import re
 import shutil
-import socket
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -26,6 +25,7 @@ from keeper.checkpoint import (
     read_checkpoint_request,
 )
 from keeper.events import ApprovalRequest
+from keeper.file_lock import FileLock
 from keeper.memory import (
     ARCHIVE_NAMES,
     FILE_NAMES,
@@ -1360,7 +1360,6 @@ TIDY_COOLDOWN_SECONDS = 30 * 60
 # 只要有一次真正编辑 / 恢复，就回到基础冷却。只延长、不缩短。
 TIDY_COOLDOWN_MAX_SECONDS = 4 * 3600
 TIDY_NO_CHANGE_STREAK_CAP = 8
-TIDY_LOCK_STALE_SECONDS = 2 * 3600
 
 
 def _cooldown_streak(state: dict) -> int:
@@ -1416,138 +1415,11 @@ def _parse_iso(value: Any) -> datetime | None:
     return _aware(parsed)
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
+class TidyLock(FileLock):
+    """整理 / 记忆写的单飞锁：锁在系统层，进程一死自动释放。"""
 
-        process_query_limited_information = 0x1000
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        handle = kernel32.OpenProcess(
-            process_query_limited_information, False, pid
-        )
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        # 5 = ERROR_ACCESS_DENIED：进程存在但不可查询；否则视为已退出。
-        return ctypes.get_last_error() == 5
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-class TidyLock:
-    """``O_EXCL + pid + stale`` 的单飞锁；进程崩溃后靠 pid / 锁龄回收。"""
-
-    def __init__(
-        self, root: Path, *, stale_seconds: float = TIDY_LOCK_STALE_SECONDS
-    ) -> None:
-        self.root = Path(root).resolve()
-        self.path = lock_path(self.root)
-        self.stale_seconds = stale_seconds
-        self._owned = False
-
-    def _read(self) -> dict | None:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError):
-            return {"invalid": True}
-        return data if isinstance(data, dict) else {"invalid": True}
-
-    def _age(self) -> float | None:
-        try:
-            return max(0.0, time.time() - self.path.stat().st_mtime)
-        except OSError:
-            return None
-
-    def _is_stale(self) -> bool:
-        data = self._read()
-        if data is None:
-            return True
-        age = self._age()
-        if age is not None and age > self.stale_seconds:
-            return True
-        pid = data.get("pid")
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        host = data.get("host")
-        if host and host != socket.gethostname():
-            return False
-        return not _pid_alive(pid)
-
-    def is_locked(self) -> bool:
-        if self._read() is None:
-            return False
-        return not self._is_stale()
-
-    def acquire(self) -> bool:
-        for _ in range(2):
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(
-                    self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                )
-            except FileExistsError:
-                if not self._is_stale():
-                    return False
-                try:
-                    self.path.unlink()
-                except OSError:
-                    return False
-                continue
-            except OSError:
-                return False
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(
-                        {
-                            "pid": os.getpid(),
-                            "started_at": _iso(_now_dt()),
-                            "host": socket.gethostname(),
-                        },
-                        fh,
-                    )
-            except OSError:
-                try:
-                    self.path.unlink()
-                except OSError:
-                    pass
-                return False
-            self._owned = True
-            return True
-        return False
-
-    def release(self) -> None:
-        if not self._owned:
-            return
-        data = self._read()
-        if data is not None and data.get("pid") not in (None, os.getpid()):
-            self._owned = False
-            return
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
-        self._owned = False
-
-    def __enter__(self) -> "TidyLock":
-        if not self.acquire():
-            raise RuntimeError("tidy lock is busy")
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
+    def __init__(self, root: Path) -> None:
+        super().__init__(lock_path(Path(root).resolve()))
 
 
 @dataclass(frozen=True)
