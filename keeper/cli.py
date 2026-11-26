@@ -48,7 +48,13 @@ from keeper.task_runner import (
     run_task_worker,
 )
 from keeper.tasks import Task, TaskStore, TaskStoreError
-from keeper.tidy import check_due, format_check, read_run_record, run_tidy
+from keeper.tidy import (
+    check_due,
+    format_check,
+    read_run_record,
+    run_record_round,
+    run_tidy,
+)
 from keeper.tools.checkpoint import RequestCheckpointTool
 from keeper.tools.dispatch import manager_dispatch_tools
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
@@ -180,6 +186,7 @@ def _manager_main(argv: list[str]) -> int:
     parser.add_argument("--root", type=Path, default=None, help="项目根目录；默认已选项目，否则当前目录")
     parser.add_argument("--model", help="覆盖模型名")
     parser.add_argument("--max-steps", type=int, help="单次运行最大步数")
+    parser.add_argument("--no-tidy", action="store_true", help="本次运行不自动记录/整理记忆")
     args = parser.parse_args(argv)
     root = _resolve_root(args.root)
     try:
@@ -213,9 +220,15 @@ def _manager_main(argv: list[str]) -> int:
     try:
         if args.message:
             render(loop.run(" ".join(args.message)))
+            _maybe_auto_tidy(root, config, llm, "manager", no_tidy=args.no_tidy,
+                             session_id=session.session_id)
             return 0
         render([SessionStart(session_id=session.session_id, path=str(session.path), model=config.model)])
-        return _repl(loop, session)[0]
+        rc, clean_exit = _repl(loop, session)
+        if clean_exit:
+            _maybe_auto_tidy(root, config, llm, "manager", no_tidy=args.no_tidy,
+                             session_id=session.session_id)
+        return rc
     except KeyboardInterrupt:
         print("\ninterrupted; session saved.", file=sys.stderr)
         return 130
@@ -446,6 +459,7 @@ def _execute_task_worker(
     worker_slug: str,
     *,
     retry: bool,
+    no_tidy: bool = False,
 ) -> int:
     """把队列项交给 worker：指派执行或阻塞后重试。"""
     project = _registered_project(root)
@@ -498,6 +512,20 @@ def _execute_task_worker(
         print(f"summary: {_short(record.summary, 300)}")
         if record.transcript:
             print(f"transcript: {record.transcript}")
+        if _tidy_enabled(config, no_tidy):
+            record_llm = llm
+            own_llm = False
+            if record_llm is None and config.api_key:
+                record_llm = LLMClient(base_url=config.base_url, api_key=config.api_key,
+                                       model=config.model, temperature=config.temperature)
+                own_llm = True
+            if record_llm is not None:
+                _maybe_auto_tidy(root, config, record_llm, "task-worker",
+                                 no_tidy=no_tidy, session_id=None)
+                if own_llm:
+                    record_llm.close()
+            else:
+                print("[memory] record warning: no API key for memory record round", file=sys.stderr)
         return 0
     except (TaskRunError, TaskStoreError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -536,6 +564,8 @@ def _task_main(argv: list[str]) -> int:
     )
     retry_parser.add_argument("id", help="任务 id")
     retry_parser.add_argument("--worker", help="换一个 worker；省略则沿用原指派")
+    retry_parser.add_argument("--no-tidy", action="store_true",
+                              help="本次 attempt 结束后不自动记录/整理项目记忆")
 
     args = parser.parse_args(argv)
 
@@ -607,7 +637,8 @@ def _task_main(argv: list[str]) -> int:
             return 2
         config = load_config(model=args.model, max_steps=args.max_steps)
         return _execute_task_worker(
-            root, store, task, config, worker_slug, retry=True
+            root, store, task, config, worker_slug, retry=True,
+            no_tidy=args.no_tidy,
         )
 
     # run
@@ -634,7 +665,8 @@ def _task_main(argv: list[str]) -> int:
 
     if task.worker:
         return _execute_task_worker(
-            root, store, task, config, task.worker, retry=False
+            root, store, task, config, task.worker, retry=False,
+            no_tidy=args.no_tidy,
         )
 
     if not config.api_key:
@@ -844,7 +876,7 @@ def _maybe_auto_tidy(
     no_tidy: bool = False,
     session_id: str | None = None,
 ) -> None:
-    """会话 / attempt 正常结束后同步整理；任何失败都只提示，不改退出码。
+    """会话 / attempt 正常结束后先同步记录，再按 due 闸门整理。
 
     跨 CLI 的“整理不抢占其它会话”仍没有可靠的低成本准入机制，所以这里
     保持同步：只在本进程的 CLI 边界跑，不拉起后台进程。
@@ -852,6 +884,15 @@ def _maybe_auto_tidy(
     if not _tidy_enabled(config, no_tidy):
         return
     try:
+        record = run_record_round(
+            root, llm, trigger=trigger, session_id=session_id
+        )
+        if record.outcome == "locked":
+            print("[memory] record skipped: tidy lock busy", file=sys.stderr)
+        elif record.outcome == "failed":
+            print(f"[memory] record warning: {record.error or 'failed'}", file=sys.stderr)
+        else:
+            print(f"[memory] record {record.outcome}", file=sys.stderr)
         report = run_tidy(
             root,
             llm,

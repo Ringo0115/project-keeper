@@ -9,8 +9,15 @@ import keeper.tidy as tidy
 from keeper.config import Config, load_config
 from keeper.llm import LLMResponse
 from keeper.memory import FILE_NAMES, memory_path
+from keeper.projects import register_project
 from keeper.tasks import TaskStore
-from keeper.tidy import TIDY_SYSTEM_PROMPT, lock_path, read_run_record, state_path
+from keeper.tidy import (
+    RECORD_SYSTEM_PROMPT,
+    TIDY_SYSTEM_PROMPT,
+    lock_path,
+    read_run_record,
+    state_path,
+)
 
 
 def _mem(root: Path) -> Path:
@@ -66,6 +73,7 @@ class FakeClient:
     def __init__(self, **kwargs) -> None:
         self.chat_calls = 0
         self.tidy_calls = 0
+        self.record_calls = 0
         self.tidy_error: Exception | None = None
         self.tidy_messages: list[list[dict]] = []
         self.chat_responses: list[dict] = []
@@ -73,6 +81,11 @@ class FakeClient:
         FakeClient.instances.append(self)
 
     def chat(self, messages, tools=None, temperature=None):
+        if messages and messages[0].get("content") == RECORD_SYSTEM_PROMPT:
+            self.record_calls += 1
+            return LLMResponse(
+                message={"role": "assistant", "content": "record complete"}, usage={}
+            )
         if _is_tidy(messages):
             self.tidy_calls += 1
             self.tidy_messages.append(messages)
@@ -114,6 +127,7 @@ def test_first_chat_run_tidies_and_second_without_delta_runs_no_llm(
     assert cli.main(["hello", "--root", str(tmp_path)]) == 0
     first = FakeClient.instances[-1]
     assert first.chat_calls == 1
+    assert first.record_calls == 1
     assert first.tidy_calls == 1
     assert state_path(tmp_path).is_file()
     record = read_run_record(tmp_path)
@@ -137,6 +151,7 @@ def test_first_chat_run_tidies_and_second_without_delta_runs_no_llm(
     assert cli.main(["hello", "--root", str(tmp_path)]) == 0
     second = FakeClient.instances[-1]
     assert second.chat_calls == 1
+    assert second.record_calls == 1
     assert second.tidy_calls == 0
 
 
@@ -158,6 +173,7 @@ def test_startup_hint_is_read_only_and_calls_no_llm(
 
     client = FakeClient.instances[-1]
     assert client.chat_calls == 0
+    assert client.record_calls == 0
     assert client.tidy_calls == 0
     err = capsys.readouterr().err
     assert "[memory] tidy due: over soft: DECISIONS.md" in err
@@ -183,6 +199,7 @@ def test_no_tidy_flag_suppresses_hint_and_pass(
 
     client = FakeClient.instances[-1]
     assert client.chat_calls == 1
+    assert client.record_calls == 0
     assert client.tidy_calls == 0
     assert "[memory]" not in capsys.readouterr().err
     assert not state_path(tmp_path).exists()
@@ -200,6 +217,7 @@ def test_memory_auto_disabled_suppresses_hint_and_pass(
 
     client = FakeClient.instances[-1]
     assert client.chat_calls == 1
+    assert client.record_calls == 0
     assert client.tidy_calls == 0
     assert "[memory]" not in capsys.readouterr().err
     assert not state_path(tmp_path).exists()
@@ -280,10 +298,12 @@ def test_repl_clean_exit_triggers_tidy_but_interrupt_does_not(
     monkeypatch.setattr(cli, "_repl", lambda loop, session: (0, True))
     assert cli.main(["--root", str(tmp_path)]) == 0
     assert FakeClient.instances[-1].tidy_calls == 1
+    assert FakeClient.instances[-1].record_calls == 1
 
     monkeypatch.setattr(cli, "_repl", lambda loop, session: (0, False))
     assert cli.main(["--root", str(tmp_path)]) == 0
     assert FakeClient.instances[-1].tidy_calls == 0
+    assert FakeClient.instances[-1].record_calls == 0
 
 
 def test_task_attempt_end_triggers_tidy(tmp_path, monkeypatch) -> None:
@@ -320,6 +340,7 @@ def test_task_attempt_end_triggers_tidy(tmp_path, monkeypatch) -> None:
     assert reloaded.status == "done"
     client = FakeClient.instances[-1]
     assert client.tidy_calls == 1
+    assert client.record_calls == 1
     record = read_run_record(tmp_path)
     assert record is not None and record["trigger"] == "task"
     session_files = sorted(
@@ -332,3 +353,18 @@ def test_task_attempt_end_triggers_tidy(tmp_path, monkeypatch) -> None:
     )
     assert session_id in tidy_prompt
     assert record["evidence_sessions"] == [session_id]
+
+
+def test_manager_session_end_runs_record_once(tmp_path, monkeypatch) -> None:
+    register_project(tmp_path, project_id="manager-demo")
+    _patch_client(monkeypatch)
+
+    assert cli.main(["manager", "review this project", "--root", str(tmp_path)]) == 0
+
+    client = FakeClient.instances[-1]
+    assert client.chat_calls == 1
+    assert client.record_calls == 1
+    assert client.tidy_calls == 0
+    record = read_run_record(tmp_path)
+    assert record is not None and record["kind"] == "record"
+    assert record["trigger"] == "manager"
