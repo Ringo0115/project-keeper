@@ -44,15 +44,28 @@ def test_approval_denied_or_exception_never_launches(tmp_path, monkeypatch):
 
 def test_cli_done_failed_empty_and_transcript(tmp_path, monkeypatch):
     brief = WorkerBrief("x", "do", ("src",))
-    codex(monkeypatch, "print('ok')")
+    codex(monkeypatch, "from pathlib import Path; Path('src').mkdir(); Path('src/out.txt').write_text('ok'); print('ok')")
     ok = dispatch_one(project(tmp_path), brief, "codex", Approver())
-    assert ok.result == "done" and ok.reply == "ok" and Path(ok.transcript).is_file()
+    assert ok.result == "done" and ok.verified and ok.reply == "ok" and Path(ok.transcript).is_file()
     codex(monkeypatch, "import sys; print('bad', file=sys.stderr); sys.exit(7)")
     failed = dispatch_one(project(tmp_path), brief, "codex", Approver())
     assert failed.result == "failed" and "7" in failed.summary and "bad" in failed.summary
     codex(monkeypatch, "pass")
     empty = dispatch_one(project(tmp_path), brief, "codex", Approver())
     assert empty.result == "failed" and "为空" in empty.summary
+
+
+def test_cli_success_without_allowed_changes_fails(tmp_path, monkeypatch):
+    codex(monkeypatch, "print('I am done')")
+    record = dispatch_one(project(tmp_path), WorkerBrief("x", "do", ("src",)), "codex", Approver())
+    assert record.result == "failed"
+    assert "声称完成但可写范围内无任何改动" in record.summary
+
+
+def test_cli_read_only_completion_is_unverified(tmp_path, monkeypatch):
+    codex(monkeypatch, "print('inspected')")
+    record = dispatch_one(project(tmp_path), WorkerBrief("x", "inspect"), "codex", Approver())
+    assert record.result == "done" and record.verified is False
 
 
 def test_cli_timeout_interrupted(tmp_path, monkeypatch):
@@ -74,7 +87,7 @@ def test_external_worker_memory_violation_restores_and_fails(tmp_path, monkeypat
 
 
 def test_fanout_parallel_waits_for_all_and_preserves_order(tmp_path, monkeypatch):
-    code = "import time,sys; time.sleep(.25); print(sys.argv[-1][:1] or 'x')"
+    code = "import time,sys; from pathlib import Path; time.sleep(.25); Path('out').mkdir(exist_ok=True); Path('out/'+sys.argv[-1][:1]+'.txt').write_text('ok'); print('ok')"
     monkeypatch.setenv("KEEPER_WORKER_CODEX_ARGV", json.dumps([sys.executable,"-c",code,"{input}"]))
     monkeypatch.setenv("KEEPER_WORKER_PI_ARGV", json.dumps([sys.executable,"-c",code,"{input}"]))
     briefs = [WorkerBrief("a", "A"), WorkerBrief("b", "B")]
@@ -104,7 +117,7 @@ def test_fanout_failure_does_not_cancel_sibling(tmp_path, monkeypatch):
 
 def test_builtin_registry_and_manager_only_dispatch_tools(tmp_path):
     names = _worker_registry(tmp_path, WorkerBrief("x", "do", ("src",)), "built-in").names()
-    assert set(names) == {"read_file", "list_dir", "search", "write_file"}
+    assert set(names) == {"read_file", "list_dir", "search", "write_file", "submit_result"}
     assert not {"dispatch_task", "dispatch_fanout", "shell", "update_memory",
                 "request_memory_checkpoint", "complete_task", "block_task"} & set(names)
     assert {tool.name for tool in manager_dispatch_tools(project(tmp_path), Approver())} == {

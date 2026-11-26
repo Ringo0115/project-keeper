@@ -47,6 +47,7 @@ class CompletionRecord:
     transcript: str | None
     started_at: str
     ended_at: str
+    verified: bool = False
 
     def __post_init__(self) -> None:
         if not self.worker:
@@ -62,8 +63,8 @@ def _now() -> str:
 
 
 def _record(worker: str, result: str, summary: str, reply: str = "", transcript: str | None = None,
-            started: str | None = None) -> CompletionRecord:
-    return CompletionRecord(worker, result, summary, reply, transcript, started or _now(), _now())
+            started: str | None = None, verified: bool = False) -> CompletionRecord:
+    return CompletionRecord(worker, result, summary, reply, transcript, started or _now(), _now(), verified)
 
 
 def _approval(project: Project, assignments: list[tuple[WorkerSpec, WorkerBrief]], approver: Any) -> str | None:
@@ -116,6 +117,17 @@ def _project_fingerprint(root: Path) -> dict[str, str]:
             except OSError:
                 continue
     return found
+
+
+def _within_allowed(rel: str, root: Path, brief: WorkerBrief) -> bool:
+    for allowed in brief.allowed:
+        try:
+            base = _safe_target(root, allowed).relative_to(root).as_posix().casefold()
+            if rel == base or rel.startswith(base.rstrip("/") + "/"):
+                return True
+        except (ValueError, OSError):
+            continue
+    return False
 
 
 def _outside_allowed(before: dict[str, str], after: dict[str, str], root: Path,
@@ -237,6 +249,23 @@ class ScopedWriteTool(Tool):
             return error(str(exc))
 
 
+class SubmitResultTool(Tool):
+    name = "submit_result"
+    description = "Submit a non-empty summary of the completed task."
+    parameters = {"type": "object", "properties": {"summary": {"type": "string"}},
+                  "required": ["summary"]}
+
+    def __init__(self, submitted: list[str]) -> None:
+        self.submitted = submitted
+
+    def execute(self, args: dict[str, Any]) -> ToolResult:
+        summary = args.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return error("summary must be a non-empty string")
+        self.submitted.append(summary.strip())
+        return ToolResult(True, "result submitted")
+
+
 class _DispatchAuthorizedApprover:
     """The one dispatch approval authorizes scoped worker writes hands-off."""
     def confirm(self, request: ApprovalRequest) -> bool:
@@ -245,11 +274,11 @@ class _DispatchAuthorizedApprover:
 
 def _worker_registry(root: Path, brief: WorkerBrief, slug: str) -> Registry:
     return Registry([ReadFileTool(root), ListDirTool(root), SearchTool(root),
-                     ScopedWriteTool(root, brief, slug)])
+                     ScopedWriteTool(root, brief, slug), SubmitResultTool([])])
 
 
 def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, context: str,
-                      *, llm: Any, max_steps: int, timeout: float) -> tuple[str, str, str | None]:
+                      *, llm: Any, max_steps: int, timeout: float) -> tuple[str, str, str | None, str]:
     """Run an isolated AgentLoop. Shell and all mutating project tools are absent."""
     from keeper.loop import AgentLoop
     from keeper.session import Session
@@ -257,19 +286,23 @@ def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, 
     session = Session.create(root, "worker")
     transcript = str(session.path)
     try:
-        registry = _worker_registry(root, brief, worker.slug)
+        submitted: list[str] = []
+        registry = Registry([ReadFileTool(root), ListDirTool(root), SearchTool(root),
+                             ScopedWriteTool(root, brief, worker.slug), SubmitResultTool(submitted)])
         loop = AgentLoop(llm=llm, registry=registry, session=session, root=root,
                          max_steps=max_steps, approver=_DispatchAuthorizedApprover(), system_override=(
-                             "你是受限 worker；只能使用当前工具。不可调用 shell、派发、任务队列、记忆治理工具。\n" + context))
+                             "Restricted worker: MUST call submit_result with a non-empty summary before "
+                             "finishing; a final answer alone is not delivery.\n" + context))
         result = "failed"; reply = ""
         for event in loop.run(context):
             if hasattr(event, "text") and event.__class__.__name__ == "FinalAnswer":
                 reply = event.text
-                result = "done" if reply.strip() else "failed"
+                result = "done" if submitted else "failed"
             if event.__class__.__name__ == "Stop":
                 result = "failed"
-        if not reply.strip(): reply = "内置 worker 未产生非空最终回复"
-        return result, reply, transcript
+        summary = submitted[-1] if submitted else "未交付结果：worker 结束时没有调用 submit_result"
+        if not reply.strip(): reply = summary if not submitted else "内置 worker 未产生非空最终回复"
+        return result, reply, transcript, summary
     finally:
         session.close()
 
@@ -282,9 +315,9 @@ def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: A
         from keeper.context import worker_context
         context = worker_context(root, project, worker, brief, since=since, completed=completed)
         if worker.kind == "built-in":
-            result, reply, transcript = _builtin_dispatch(project, worker, brief, context,
+            result, reply, transcript, summary = _builtin_dispatch(project, worker, brief, context,
                                                           llm=llm, max_steps=max_steps, timeout=timeout)
-            return _record(worker.slug, result, "内置 loop 完成" if result == "done" else reply, reply, transcript, started)
+            return _record(worker.slug, result, summary, reply, transcript, started, verified=result == "done")
         snapshot = _snapshot(root)
         before_files = _project_fingerprint(root)
         transcript_path = _transcript_path(root, worker.slug)
@@ -301,13 +334,19 @@ def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: A
             changed = _restore_changed(snapshot)
             if changed:
                 return _record(worker.slug, "failed", "worker 违规写了项目记忆文件；已从快照还原", reply, str(transcript_path), started)
-            outside = _outside_allowed(before_files, _project_fingerprint(root), root, brief, worker.slug, transcript_path)
+            after_files = _project_fingerprint(root)
+            outside = _outside_allowed(before_files, after_files, root, brief, worker.slug, transcript_path)
+            allowed_changed = any(before_files.get(rel) != after_files.get(rel)
+                                  for rel in set(before_files) | set(after_files)
+                                  if _within_allowed(rel, root, brief))
             scope_note = f"；提示：检测到 allowed 范围外改动：{', '.join(outside[:20])}" if outside else ""
             if proc.returncode != 0:
                 return _record(worker.slug, "failed", f"退出码 {proc.returncode}; stderr: {stderr or '(空)'}{scope_note}", reply, str(transcript_path), started)
             if not reply:
                 return _record(worker.slug, "failed", f"退出码为 0 但回复为空，不能判定成功{scope_note}", "", str(transcript_path), started)
-            return _record(worker.slug, "done", f"外部 worker 返回候选结果（需管理者核验）{scope_note}", reply, str(transcript_path), started)
+            if brief.allowed and not allowed_changed:
+                return _record(worker.slug, "failed", "声称完成但可写范围内无任何改动" + scope_note, reply, str(transcript_path), started)
+            return _record(worker.slug, "done", f"外部 worker 返回候选结果（需管理者核验）{scope_note}", reply, str(transcript_path), started, verified=bool(brief.allowed and allowed_changed))
         except subprocess.TimeoutExpired as exc:
             _restore_changed(snapshot)
             output = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")

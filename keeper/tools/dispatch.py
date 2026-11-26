@@ -11,10 +11,11 @@ from keeper.tools.base import Tool, ToolResult, error
 from keeper.workers import default_workers
 
 
-def _record_dict(record: CompletionRecord) -> dict[str, str | None]:
+def _record_dict(record: CompletionRecord) -> dict[str, str | None | bool]:
     return {"worker": record.worker, "result": record.result, "summary": record.summary,
             "reply": record.reply, "transcript": record.transcript,
-            "started_at": record.started_at, "ended_at": record.ended_at}
+            "started_at": record.started_at, "ended_at": record.ended_at,
+            "verified": record.verified}
 
 
 class DispatchTaskTool(Tool):

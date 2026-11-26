@@ -28,12 +28,18 @@ class Approver:
 
 
 class FakeLLM:
-    def __init__(self, text: str = "done") -> None:
+    def __init__(self, text: str = "done", *, submit: bool = True) -> None:
         self.text = text
+        self.submit = submit
         self.calls: list[list[dict]] = []
 
     def chat(self, messages, tools=None) -> LLMResponse:
         self.calls.append(messages)
+        if self.submit and len(self.calls) == 1:
+            return LLMResponse(message={"role": "assistant", "content": "", "tool_calls": [
+                {"id": "submit-1", "type": "function", "function": {
+                    "name": "submit_result", "arguments": json.dumps({"summary": "交付结果"})}}
+            ]}, usage={})
         return LLMResponse(message={"role": "assistant", "content": self.text}, usage={})
 
 
@@ -178,6 +184,16 @@ def test_retry_with_builtin_worker_handoff_and_new_session(tmp_path: Path) -> No
     assert "上一轮完成记录" in context
     assert "缺少接口文档" in context
     assert "task " + task_id in context
+
+
+def test_builtin_worker_without_submit_result_fails(tmp_path: Path) -> None:
+    store = TaskStore.load(tmp_path)
+    task_id = _block(store, "需要交付")
+    record = run_task_worker(project(tmp_path), store, task_id, "built-in", retry=True,
+                             approver=Approver(), llm=FakeLLM("我做完了", submit=False))
+    assert record.result == "failed"
+    assert "未交付结果" in record.summary and "submit_result" in record.summary
+    assert store.get(task_id).status == "blocked"
 
 
 def test_retry_switches_worker_and_keeps_prior_completion_record(
