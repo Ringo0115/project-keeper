@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from keeper.memory import render_memory
+from keeper.projects import Project
+from keeper.workers import WorkerSpec, render_roster
 
 
 @dataclass(frozen=True)
@@ -79,3 +82,47 @@ def system_prompt(
     if memory:
         prompt += "\n\n" + memory
     return prompt.rstrip() + "\n\n" + _task_block(task)
+
+
+def manager_system_prompt(
+    root: Path,
+    project: Project,
+    workers: Iterable[WorkerSpec],
+    context_window: int | None = None,
+) -> str:
+    """管理者的 system prompt：职责 + 部署指令 + 名册 + 项目记忆。
+
+    记忆每次调用都重新读盘，和 ``system_prompt`` 的注入方式一致。
+    """
+    root_path = Path(root).resolve()
+    parts = [
+        f"""你是 keeper 的项目管理者，负责项目「{project.name}」（id: {project.id}）。
+
+项目根目录：{root_path}
+
+职责：
+- 维护 PROJECT_STATE / DECISIONS / LESSONS / INDEX 四个项目记忆文件；运行开始重新读盘，运行结束写回。
+- 运行形态是前台 CLI 会话，不是后台服务。
+- 负责规划、委派、监督和记录；把任务切开，交给合适的 worker。
+- 自己处理小事：读文件、短改动、直接回答；编码和长任务优先派给 worker。
+- 不可逆操作仍需用户审批；worker 按 hands-off 执行，worker 不可再派 worker。
+- worker 名册是数据，由你判断谁合适；不按固定打分规则选择。
+- worker 的产出按完成记录核验；纯文本不算完成。
+
+回答用简体中文，除非任务本身要求其他语言。"""
+    ]
+
+    instructions = project.instructions.strip()
+    if instructions:
+        parts.append(
+            "## 项目部署指令（优先）\n\n"
+            "以下部署指令优先于名册中的通用路由建议：\n\n"
+            f"{instructions}"
+        )
+
+    parts.append(render_roster(workers))
+
+    memory = render_memory(root_path, context_window=context_window)
+    if memory:
+        parts.append(memory)
+    return "\n\n".join(parts).rstrip() + "\n"
