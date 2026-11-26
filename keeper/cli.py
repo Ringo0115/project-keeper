@@ -38,11 +38,14 @@ from keeper.projects import (
     register_project,
     use_project,
 )
+from keeper.prompts import manager_system_prompt
+from keeper.workers import roster_for
 from keeper.session import Session
 from keeper.task_runner import TaskRunError, prepare_task_run, run_task_once
 from keeper.tasks import Task, TaskStore, TaskStoreError
 from keeper.tidy import check_due, format_check, read_run_record, run_tidy
 from keeper.tools.checkpoint import RequestCheckpointTool
+from keeper.tools.dispatch import manager_dispatch_tools
 from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool, WriteFileTool
 from keeper.tools.memory import UpdateMemoryTool
 from keeper.tools.registry import Registry
@@ -164,6 +167,56 @@ def _build_registry(root: Path) -> Registry:
             ShellTool(root),
         ]
     )
+
+
+def _manager_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="keeper manager", description="项目管理 agent（M6）")
+    parser.add_argument("message", nargs="*", help="给管理者的任务；省略则进入交互模式")
+    parser.add_argument("--root", type=Path, default=None, help="项目根目录；默认已选项目，否则当前目录")
+    parser.add_argument("--model", help="覆盖模型名")
+    parser.add_argument("--max-steps", type=int, help="单次运行最大步数")
+    args = parser.parse_args(argv)
+    root = _resolve_root(args.root)
+    try:
+        registry_data = load_registry()
+    except RegistryError as exc:
+        print(f"error: 无法读取项目注册表：{exc}", file=sys.stderr)
+        return 2
+    project = next((p for p in registry_data.projects.values() if p.root.resolve() == root), None)
+    if project is None:
+        print(f"error: 管理者需要已注册项目；请先运行 keeper project register {root}", file=sys.stderr)
+        return 2
+    if not root.is_dir():
+        print(f"error: root is not a directory: {root}", file=sys.stderr)
+        return 2
+    config = load_config(model=args.model, max_steps=args.max_steps)
+    if not config.api_key:
+        print(_api_key_error(), file=sys.stderr)
+        return 2
+    session = Session.create(root, config.model)
+    llm = LLMClient(base_url=config.base_url, api_key=config.api_key, model=config.model,
+                    temperature=config.temperature)
+    approver = StdioApprover(timeout=config.approval_timeout)
+    tools = [ReadFileTool(root), ListDirTool(root), WriteFileTool(root), SearchTool(root),
+             UpdateMemoryTool(root), RequestCheckpointTool(root), ShellTool(root),
+             *manager_dispatch_tools(project, approver, llm=llm, max_steps=config.max_steps)]
+    loop = AgentLoop(llm=llm, registry=Registry(tools), session=session, root=root,
+                     max_steps=config.max_steps, approver=approver,
+                     context_window=config.context_window, reserve_tokens=config.reserve_tokens,
+                     keep_tokens=config.keep_tokens,
+                     system_override=manager_system_prompt(root, project, roster_for(project), config.context_window))
+    try:
+        if args.message:
+            render(loop.run(" ".join(args.message)))
+            return 0
+        render([SessionStart(session_id=session.session_id, path=str(session.path), model=config.model)])
+        return _repl(loop, session)[0]
+    except KeyboardInterrupt:
+        print("\ninterrupted; session saved.", file=sys.stderr)
+        return 130
+    finally:
+        llm.close()
+        session.close()
 
 
 def _open_session(
@@ -794,6 +847,13 @@ def main(argv: list[str] | None = None) -> int:
             return _project_main(raw[1:])
         except KeyboardInterrupt:
             print("\ninterrupted.", file=sys.stderr)
+            return 130
+
+    if raw and raw[0] == "manager":
+        try:
+            return _manager_main(raw[1:])
+        except KeyboardInterrupt:
+            print("\ninterrupted; manager session saved.", file=sys.stderr)
             return 130
 
     if raw and raw[0] == "memory":

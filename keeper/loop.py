@@ -84,11 +84,16 @@ class AgentLoop:
         context_window: int = DEFAULT_CONTEXT_WINDOW,
         reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
         keep_tokens: int = DEFAULT_KEEP_TOKENS,
+        system_override: str | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.session = session
-        self.system = system_prompt(root, task, context_window=context_window)
+        self.system = (
+            system_override
+            if system_override is not None
+            else system_prompt(root, task, context_window=context_window)
+        )
         self.max_steps = max_steps
         self.root = Path(root).resolve()
         self.approver = approver

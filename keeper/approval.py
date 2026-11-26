@@ -282,6 +282,8 @@ class StdioApprover:
             file=self.stream,
             flush=True,
         )
+        if request.detail:
+            print(request.detail, file=self.stream, flush=True)
         try:
             answer = _read_line(self.timeout)
         except (EOFError, KeyboardInterrupt, OSError):
