@@ -6,6 +6,8 @@ import json
 import hashlib
 import os
 import subprocess
+import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from keeper.events import ApprovalRequest
+from keeper.fanout import FanoutBatch
 from keeper.memory import FILE_NAMES, INJECTION_ORDER, memory_path
 from keeper.projects import Project
 from keeper.tools.base import Tool, ToolResult, error
@@ -288,6 +291,57 @@ def _worker_registry(root: Path, brief: WorkerBrief, slug: str) -> Registry:
                      ScopedWriteTool(root, brief, slug), SubmitResultTool([])])
 
 
+# ---------------------------------------------------------------------------
+# 活着的 worker 子进程：中断时整棵进程树一起杀，不留后台孤儿
+# ---------------------------------------------------------------------------
+
+_LIVE_LOCK = threading.Lock()
+_LIVE_PROCS: dict[int, subprocess.Popen] = {}
+
+
+def _register_live(proc: subprocess.Popen) -> None:
+    with _LIVE_LOCK:
+        _LIVE_PROCS[proc.pid] = proc
+
+
+def _unregister_live(proc: subprocess.Popen) -> None:
+    with _LIVE_LOCK:
+        _LIVE_PROCS.pop(proc.pid, None)
+
+
+def kill_live_workers() -> list[int]:
+    """杀掉所有仍在运行的 worker 子进程树，返回被杀的 pid 列表。"""
+    with _LIVE_LOCK:
+        procs = list(_LIVE_PROCS.values())
+    killed: list[int] = []
+    for proc in procs:
+        if proc.poll() is None:
+            _kill_tree(proc)
+            killed.append(proc.pid)
+    return killed
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Windows 用 taskkill /T 连子进程一起杀；POSIX 先 terminate 再 kill。"""
+    if proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, context: str,
                       *, llm: Any, max_steps: int, timeout: float) -> tuple[str, str, str | None, str]:
     """Run an isolated AgentLoop. Shell and all mutating project tools are absent."""
@@ -318,7 +372,7 @@ def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, 
         session.close()
 
 
-def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: Any,
+def _run_one_inner(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: Any,
              max_steps: int, timeout: float, completed: Iterable[CompletionRecord] = (),
              since: str | int | float | None = None,
              session_path: Path | None = None) -> CompletionRecord:
@@ -336,14 +390,27 @@ def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: A
         transcript_path = _transcript_path(root, worker.slug)
         argv = _cli_argv(worker.slug, context)
         try:
-            proc = subprocess.run(argv, cwd=root, input=context, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=timeout,
-                                  shell=False)
-            reply = proc.stdout.strip()
-            stderr = proc.stderr.strip()[:2000]
+            proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                    errors="replace", shell=False)
+            _register_live(proc)
+            try:
+                out, err = proc.communicate(input=context, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)
+                raise
+            except KeyboardInterrupt:
+                _kill_tree(proc)
+                raise
+            finally:
+                _unregister_live(proc)
+            stdout = out or ""
+            stderr_text = err or ""
+            reply = stdout.strip()
+            stderr = stderr_text.strip()[:2000]
             with transcript_path.open("w", encoding="utf-8") as fh:
                 fh.write("ARGV: " + json.dumps(argv, ensure_ascii=False) + "\nSTDIN:\n" + context +
-                         "\nSTDOUT:\n" + proc.stdout + "\nSTDERR:\n" + proc.stderr)
+                         "\nSTDOUT:\n" + stdout + "\nSTDERR:\n" + stderr_text)
             changed = _restore_changed(snapshot)
             if changed:
                 return _record(worker.slug, "failed", "worker 违规写了项目记忆文件；已从快照还原", reply, str(transcript_path), started)
@@ -383,6 +450,19 @@ def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: A
         return _record(worker.slug, "failed", f"派发失败：{type(exc).__name__}: {exc}", "", None, started)
 
 
+def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, batch: FanoutBatch | None = None,
+             **rest: Any) -> CompletionRecord:
+    """跑一个 worker；有批次记录时把结果吸收进批次（只吸收一次）。"""
+    record = _run_one_inner(project, worker, brief, **rest)
+    if batch is not None:
+        try:
+            batch.absorb(brief.label, status=record.result, summary=record.summary,
+                         transcript=record.transcript)
+        except OSError:
+            pass
+    return record
+
+
 def dispatch_one(project: Project, brief: WorkerBrief, worker: WorkerSpec | str,
                  approver: Any, *, llm: Any = None, max_steps: int = 30,
                  timeout: float = DEFAULT_TIMEOUT,
@@ -414,12 +494,32 @@ def dispatch_fanout(project: Project, briefs: Iterable[WorkerBrief], workers: It
     if reason: return [_record(spec.slug, "blocked", reason) for spec, _ in typed]
     if any(spec.kind == "built-in" for spec, _ in typed) and llm is None:
         return [_record(spec.slug, "failed", "built-in worker 缺少 LLM client") for spec, _ in typed]
+    root = Path(project.root).resolve()
+    try:
+        batch: FanoutBatch | None = FanoutBatch.create(
+            root, [(spec.slug, job.label) for spec, job in typed])
+    except OSError:
+        batch = None  # 批次记录落盘失败不阻断派发，只是事后查不到这一批
     results: list[CompletionRecord | None] = [None] * len(typed)
-    with ThreadPoolExecutor(max_workers=len(typed), thread_name_prefix="keeper-worker") as pool:
-        futures = {pool.submit(_run_one, project, spec, job, llm=llm, max_steps=max_steps, timeout=timeout): i
-                   for i, (spec, job) in enumerate(typed)}
+    pool = ThreadPoolExecutor(max_workers=len(typed), thread_name_prefix="keeper-worker")
+    futures = {pool.submit(_run_one, project, spec, job, batch=batch, llm=llm,
+                           max_steps=max_steps, timeout=timeout): i
+               for i, (spec, job) in enumerate(typed)}
+    try:
         for future in as_completed(futures):
             i = futures[future]
             try: results[i] = future.result()
             except BaseException as exc: results[i] = _record(typed[i][0].slug, "failed", f"worker crashed: {exc}")
+    except BaseException:
+        # 中断：先杀掉还在跑的子进程树，再把整批收尾落盘，最后照旧往外抛
+        kill_live_workers()
+        if batch is not None:
+            try: batch.resolve("interrupted")
+            except OSError: pass
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=False)
+    if batch is not None:
+        try: batch.resolve("finished")
+        except OSError: pass
     return [record for record in results if record is not None]
