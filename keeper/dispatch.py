@@ -130,6 +130,17 @@ def _within_allowed(rel: str, root: Path, brief: WorkerBrief) -> bool:
     return False
 
 
+def _scope_note(before_files: dict[str, str], root: Path, brief: WorkerBrief, slug: str,
+                transcript_path: Path) -> str:
+    """中断 / 超时 / 启动失败路径上的越界提示；只提示，不还原。"""
+    try:
+        after = _project_fingerprint(root)
+        outside = _outside_allowed(before_files, after, root, brief, slug, transcript_path)
+    except (OSError, ValueError):
+        return ""
+    return f"；提示：检测到 allowed 范围外改动：{', '.join(outside[:20])}" if outside else ""
+
+
 def _outside_allowed(before: dict[str, str], after: dict[str, str], root: Path,
                      brief: WorkerBrief, slug: str, exclude: Path | None = None) -> list[str]:
     changed = [path for path in set(before) | set(after) if before.get(path) != after.get(path)]
@@ -351,18 +362,21 @@ def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: A
             return _record(worker.slug, "done", f"外部 worker 返回候选结果（需管理者核验）{scope_note}", reply, str(transcript_path), started, verified=bool(brief.allowed and allowed_changed))
         except subprocess.TimeoutExpired as exc:
             _restore_changed(snapshot)
+            note = _scope_note(before_files, root, brief, worker.slug, transcript_path)
             output = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
             err = (exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
             transcript_path.write_text(f"STDIN:\n{context}\nSTDOUT:\n{output}\nSTDERR:\n{err}", encoding="utf-8")
-            return _record(worker.slug, "interrupted", f"worker 超时（{timeout:g}s）", output, str(transcript_path), started)
+            return _record(worker.slug, "interrupted", f"worker 超时（{timeout:g}s）{note}", output, str(transcript_path), started)
         except KeyboardInterrupt:
             _restore_changed(snapshot)
+            note = _scope_note(before_files, root, brief, worker.slug, transcript_path)
             transcript_path.write_text(f"STDIN:\n{context}\n\n[interrupted]", encoding="utf-8")
-            return _record(worker.slug, "interrupted", "worker 被中断", "", str(transcript_path), started)
+            return _record(worker.slug, "interrupted", f"worker 被中断{note}", "", str(transcript_path), started)
         except OSError as exc:
             _restore_changed(snapshot)
+            note = _scope_note(before_files, root, brief, worker.slug, transcript_path)
             transcript_path.write_text(f"STDIN:\n{context}\n\n[launch failed: {exc}]", encoding="utf-8")
-            return _record(worker.slug, "failed", f"无法启动 worker：{exc}", "", str(transcript_path), started)
+            return _record(worker.slug, "failed", f"无法启动 worker：{exc}{note}", "", str(transcript_path), started)
         finally:
             pass
     except Exception as exc:

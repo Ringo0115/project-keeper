@@ -68,6 +68,13 @@ def test_cli_read_only_completion_is_unverified(tmp_path, monkeypatch):
     assert record.result == "done" and record.verified is False
 
 
+def test_cli_timeout_reports_outside_allowed_changes(tmp_path, monkeypatch):
+    codex(monkeypatch, "import time; from pathlib import Path; Path('stray.txt').write_text('x'); time.sleep(5)")
+    record = dispatch_one(project(tmp_path), WorkerBrief("x", "do", ("src",)), "codex", Approver(), timeout=1.0)
+    assert record.result == "interrupted" and "范围外" in record.summary
+    assert (tmp_path / "stray.txt").read_text() == "x"
+
+
 def test_cli_timeout_interrupted(tmp_path, monkeypatch):
     codex(monkeypatch, "import time; time.sleep(2)")
     record = dispatch_one(project(tmp_path), WorkerBrief("x", "do"), "codex", Approver(), timeout=.05)
