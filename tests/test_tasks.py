@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from keeper.atomic_write import TMP_SUFFIX, tmp_prefix
 from keeper.approval import Decision, review
 from keeper.events import TaskEvent, ToolResultEvent
 from keeper.llm import LLMResponse
@@ -551,13 +552,13 @@ def test_atomic_write_failure_keeps_original(
     def boom(src: object, dst: object) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("keeper.tasks.os.replace", boom)
+    monkeypatch.setattr("keeper.atomic_write.os.replace", boom)
     store.tasks[0].title = "改坏的任务"
     with pytest.raises(TaskStoreError):
         store.save()
 
     assert path.read_bytes() == before
-    assert list(path.parent.glob("tasks.json.tmp*")) == []
+    assert list(path.parent.glob(f"{tmp_prefix(path.name)}*{TMP_SUFFIX}")) == []
 
 
 # ---------------------------------------------------------------------------
