@@ -109,8 +109,10 @@ def test_add_load_roundtrip_keeps_queue_order(tmp_path: Path) -> None:
         "created_at",
         "updated_at",
         "block_reason",
+        "worker",
         "attempts",
     }
+    assert raw["worker"] is None
     assert raw["attempts"] == []
     assert datetime.fromisoformat(raw["created_at"]).utcoffset() is not None
 

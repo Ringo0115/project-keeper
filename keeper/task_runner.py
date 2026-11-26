@@ -16,11 +16,14 @@ from keeper.config import (
     DEFAULT_KEEP_TOKENS,
     DEFAULT_RESERVE_TOKENS,
 )
+from keeper.context import WorkerBrief
+from keeper.dispatch import DEFAULT_TIMEOUT, CompletionRecord, dispatch_one
 from keeper.events import Event, FinalAnswer, TaskEvent, ToolResultEvent
 from keeper.loop import AgentLoop, ChatLLM
 from keeper.prompts import TaskContext
+from keeper.projects import Project
 from keeper.session import SESSIONS_DIR, Session
-from keeper.tasks import TaskStore
+from keeper.tasks import Task, TaskStore
 from keeper.tools.registry import Registry
 from keeper.tools.tasks import BlockTaskTool, CompleteTaskTool
 
@@ -211,3 +214,105 @@ def run_task_once(
                     "下次启动会标记 interrupted"
                 ),
             )
+
+
+# ---------------------------------------------------------------------------
+# M6 R7/R8：队列项交给 worker 执行与交接
+# ---------------------------------------------------------------------------
+
+
+def _completed_records(task: Task) -> list[CompletionRecord]:
+    """把已结束的 attempt 转成完成记录；transcript 只引用路径，不复制内容。
+
+    管理者自己跑完的 attempt 没有 worker，记录为 manager，便于下一轮知道
+    上一轮是谁、为什么阻塞。
+    """
+    records: list[CompletionRecord] = []
+    for attempt in task.attempts:
+        if attempt.ended_at is None or not attempt.result:
+            continue
+        records.append(
+            CompletionRecord(
+                worker=attempt.worker or "manager",
+                result=attempt.result,
+                summary=attempt.summary or "",
+                reply="",
+                transcript=attempt.transcript,
+                started_at=attempt.started_at,
+                ended_at=attempt.ended_at,
+            )
+        )
+    return records
+
+
+def _since_last_attempt(task: Task) -> str | None:
+    for attempt in reversed(task.attempts):
+        if attempt.ended_at:
+            return attempt.ended_at
+    return None
+
+
+def _finish_from_record(
+    store: TaskStore, task_id: str, record: CompletionRecord
+) -> None:
+    """沿用 R4 的完成判定，只决定队列状态；不新增判定规则。"""
+    if record.result == "done":
+        store.complete(task_id, summary=record.summary, transcript=record.transcript)
+    elif record.result == "blocked":
+        store.block(task_id, record.summary, transcript=record.transcript)
+    else:
+        store.fail(
+            task_id,
+            record.summary,
+            result=record.result,
+            transcript=record.transcript,
+        )
+
+
+def run_task_worker(
+    project: Project,
+    store: TaskStore,
+    task_id: str,
+    worker_slug: str,
+    *,
+    retry: bool,
+    approver: Approver | None,
+    llm: ChatLLM | None = None,
+    max_steps: int = 30,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> CompletionRecord:
+    """把一条队列项交给指定 worker，在新会话里跑一次并记录 attempt。
+
+    - retry=False：queued → running（`keeper task run` 的指派执行）。
+    - retry=True：blocked → running（`keeper task retry`），可换 worker。
+    - 交接上下文：共享记忆 + recap（上次尝试之后）+ 日志路径 + 此前完成记录。
+    - worker 结果按 R4 判定写入 attempt；done 才算完成，其余都回 blocked。
+    """
+    task = store.get(task_id)
+    if task is None:
+        raise TaskRunError(f"任务不存在: {task_id}")
+    completed = _completed_records(task)
+    since = _since_last_attempt(task)
+    if retry:
+        attempt = store.retry_attempt(task_id, worker=worker_slug)
+    else:
+        attempt = store.start_attempt(task_id, None, worker=worker_slug)
+
+    brief = WorkerBrief(label=f"task {task.id}", task=task.title)
+    record = dispatch_one(
+        project,
+        brief,
+        worker_slug,
+        approver,
+        llm=llm,
+        max_steps=max_steps,
+        timeout=timeout,
+        completed=completed,
+        since=since,
+    )
+    if attempt.session_id is None and record.transcript:
+        candidate = Path(record.transcript)
+        if candidate.parent == Path(project.root).resolve() / SESSIONS_DIR:
+            attempt.session_id = candidate.stem
+    _finish_from_record(store, task_id, record)
+    return record

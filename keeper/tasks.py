@@ -22,7 +22,10 @@ TASKS_FILE = Path(".agent") / "tasks.json"
 VERSION = 1
 
 STATUSES = {"queued", "running", "blocked", "done"}
-OUTCOMES = {"done", "blocked", "interrupted", "incomplete"}
+OUTCOMES = {"done", "blocked", "interrupted", "incomplete", "failed"}
+# R4 CompletionRecord 的结果取值；attempt.result 与 outcome 分开记录，
+# outcome 驱动 M3 状态机，result 记录 worker 的完成判定。
+ATTEMPT_RESULTS = {"done", "blocked", "failed", "interrupted"}
 TERMINAL = {"blocked", "done"}
 
 
@@ -47,6 +50,10 @@ class Attempt:
     ended_at: str | None = None
     outcome: str | None = None
     block_reason: str | None = None
+    worker: str | None = None
+    result: str | None = None
+    summary: str | None = None
+    transcript: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +62,10 @@ class Attempt:
             "ended_at": self.ended_at,
             "outcome": self.outcome,
             "block_reason": self.block_reason,
+            "worker": self.worker,
+            "result": self.result,
+            "summary": self.summary,
+            "transcript": self.transcript,
         }
 
     @classmethod
@@ -66,6 +77,11 @@ class Attempt:
         ended_at = data.get("ended_at")
         outcome = data.get("outcome")
         block_reason = data.get("block_reason")
+        # M6 R7 之前写入的 attempt 没有这四个字段，缺失一律按 None 读取。
+        worker = data.get("worker")
+        result = data.get("result")
+        summary = data.get("summary")
+        transcript = data.get("transcript")
         if session_id is not None and not isinstance(session_id, str):
             raise TaskStoreError(f"tasks.json 损坏：attempt[{index}].session_id 类型错误")
         if not isinstance(started_at, str) or not started_at:
@@ -78,12 +94,25 @@ class Attempt:
             )
         if block_reason is not None and not isinstance(block_reason, str):
             raise TaskStoreError(f"tasks.json 损坏：attempt[{index}].block_reason 类型错误")
+        if worker is not None and not isinstance(worker, str):
+            raise TaskStoreError(f"tasks.json 损坏：attempt[{index}].worker 类型错误")
+        if result is not None and result not in ATTEMPT_RESULTS:
+            raise TaskStoreError(
+                f"tasks.json 损坏：attempt[{index}].result={result!r} 不合法"
+            )
+        for key, value in (("summary", summary), ("transcript", transcript)):
+            if value is not None and not isinstance(value, str):
+                raise TaskStoreError(f"tasks.json 损坏：attempt[{index}].{key} 类型错误")
         return cls(
             session_id=session_id,
             started_at=started_at,
             ended_at=ended_at,
             outcome=outcome,
             block_reason=block_reason,
+            worker=worker,
+            result=result,
+            summary=summary,
+            transcript=transcript,
         )
 
 
@@ -96,6 +125,7 @@ class Task:
     updated_at: str
     block_reason: str | None = None
     attempts: list[Attempt] = field(default_factory=list)
+    worker: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +135,7 @@ class Task:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "block_reason": self.block_reason,
+            "worker": self.worker,
             "attempts": [attempt.to_dict() for attempt in self.attempts],
         }
 
@@ -122,6 +153,7 @@ class Task:
         created_at = data["created_at"]
         updated_at = data["updated_at"]
         block_reason = data.get("block_reason")
+        worker = data.get("worker")
         if not isinstance(task_id, str) or not task_id:
             raise TaskStoreError(f"tasks.json 损坏：tasks[{index}].id 不合法")
         if not isinstance(title, str):
@@ -134,6 +166,8 @@ class Task:
             raise TaskStoreError(f"tasks.json 损坏：tasks[{index}] 时间字段类型错误")
         if block_reason is not None and not isinstance(block_reason, str):
             raise TaskStoreError(f"tasks.json 损坏：tasks[{index}].block_reason 类型错误")
+        if worker is not None and not isinstance(worker, str):
+            raise TaskStoreError(f"tasks.json 损坏：tasks[{index}].worker 类型错误")
         raw_attempts = data["attempts"]
         if not isinstance(raw_attempts, list):
             raise TaskStoreError(f"tasks.json 损坏：tasks[{index}].attempts 不是数组")
@@ -149,6 +183,7 @@ class Task:
             updated_at=updated_at,
             block_reason=block_reason,
             attempts=attempts,
+            worker=worker,
         )
 
     # ---------- 查询 ----------
@@ -307,10 +342,12 @@ class TaskStore:
 
     # ---------- 状态转换 ----------
 
-    def add(self, title: str) -> Task:
+    def add(self, title: str, *, worker: str | None = None) -> Task:
         cleaned = title.strip()
         if not cleaned:
             raise TaskStoreError("任务标题不能为空")
+        if worker is not None and (not isinstance(worker, str) or not worker.strip()):
+            raise TaskStoreError("worker 指派不能为空字符串")
         now = now_iso()
         task = Task(
             id=_new_task_id(now),
@@ -318,12 +355,15 @@ class TaskStore:
             status="queued",
             created_at=now,
             updated_at=now,
+            worker=worker.strip() if worker else None,
         )
         self.tasks.append(task)
         self.save()
         return task
 
-    def start_attempt(self, task_id: str, session_id: str) -> Attempt:
+    def start_attempt(
+        self, task_id: str, session_id: str | None, *, worker: str | None = None
+    ) -> Attempt:
         """queued → running，追加一条打开中的 attempt，先落盘再跑 loop。"""
         task = self._require(task_id)
         if task.status != "queued":
@@ -336,15 +376,45 @@ class TaskStore:
                 f"已有 running 任务 {other.id}；同一项目同时只能有一个"
             )
         now = now_iso()
-        attempt = Attempt(session_id=session_id, started_at=now)
+        attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
         task.attempts.append(attempt)
         task.status = "running"
         task.block_reason = None
+        if worker is not None:
+            task.worker = worker
         task.updated_at = now
         self.save()
         return attempt
 
-    def complete(self, task_id: str) -> None:
+    def retry_attempt(
+        self, task_id: str, session_id: str | None = None, *, worker: str | None = None
+    ) -> Attempt:
+        """blocked → running：阻塞或失败的项在新会话里重跑，可换 worker。"""
+        task = self._require(task_id)
+        if task.status != "blocked":
+            raise TaskStoreError(
+                f"任务 {task.id} 当前状态为 {task.status}，"
+                "只有 blocked（阻塞或失败）可以重试"
+            )
+        other = self.running()
+        if other is not None:
+            raise TaskStoreError(
+                f"已有 running 任务 {other.id}；同一项目同时只能有一个"
+            )
+        now = now_iso()
+        attempt = Attempt(session_id=session_id, started_at=now, worker=worker)
+        task.attempts.append(attempt)
+        task.status = "running"
+        task.block_reason = None
+        if worker is not None:
+            task.worker = worker
+        task.updated_at = now
+        self.save()
+        return attempt
+
+    def complete(
+        self, task_id: str, *, summary: str | None = None, transcript: str | None = None
+    ) -> None:
         """running → done，立即收尾，防止完成之后崩溃丢失 done。"""
         task = self._require(task_id)
         if task.status != "running":
@@ -356,12 +426,22 @@ class TaskStore:
         attempt.ended_at = now
         attempt.outcome = "done"
         attempt.block_reason = None
+        attempt.result = "done"
+        attempt.summary = summary
+        attempt.transcript = transcript
         task.status = "done"
         task.block_reason = None
         task.updated_at = now
         self.save()
 
-    def block(self, task_id: str, reason: str) -> None:
+    def block(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        summary: str | None = None,
+        transcript: str | None = None,
+    ) -> None:
         """running → blocked；reason 去空白后为空则拒绝，且不落盘。"""
         cleaned = reason.strip() if isinstance(reason, str) else ""
         if not cleaned:
@@ -376,6 +456,41 @@ class TaskStore:
         attempt.ended_at = now
         attempt.outcome = "blocked"
         attempt.block_reason = cleaned
+        attempt.result = "blocked"
+        attempt.summary = summary if summary is not None else cleaned
+        attempt.transcript = transcript
+        task.status = "blocked"
+        task.block_reason = cleaned
+        task.updated_at = now
+        self.save()
+
+    def fail(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        result: str = "failed",
+        transcript: str | None = None,
+    ) -> None:
+        """running → blocked，记录 failed / interrupted；任务可 retry。"""
+        cleaned = reason.strip() if isinstance(reason, str) else ""
+        if not cleaned:
+            raise TaskStoreError("fail 原因不能为空")
+        if result not in {"failed", "interrupted"}:
+            raise TaskStoreError(f"fail result={result!r} 不合法")
+        task = self._require(task_id)
+        if task.status != "running":
+            raise TaskStoreError(
+                f"任务 {task.id} 当前状态为 {task.status}，不能标记失败"
+            )
+        attempt = self._open_attempt(task)
+        now = now_iso()
+        attempt.ended_at = now
+        attempt.outcome = result
+        attempt.block_reason = cleaned
+        attempt.result = result
+        attempt.summary = cleaned
+        attempt.transcript = transcript
         task.status = "blocked"
         task.block_reason = cleaned
         task.updated_at = now

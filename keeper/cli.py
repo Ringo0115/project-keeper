@@ -39,9 +39,14 @@ from keeper.projects import (
     use_project,
 )
 from keeper.prompts import manager_system_prompt
-from keeper.workers import roster_for
+from keeper.workers import WorkerError, default_workers, roster_for
 from keeper.session import Session
-from keeper.task_runner import TaskRunError, prepare_task_run, run_task_once
+from keeper.task_runner import (
+    TaskRunError,
+    prepare_task_run,
+    run_task_once,
+    run_task_worker,
+)
 from keeper.tasks import Task, TaskStore, TaskStoreError
 from keeper.tidy import check_due, format_check, read_run_record, run_tidy
 from keeper.tools.checkpoint import RequestCheckpointTool
@@ -327,6 +332,8 @@ def _print_task_list(store: TaskStore) -> None:
         )
         if task.block_reason:
             line += f"  · blocked: {_short(task.block_reason, 160)}"
+        if task.worker:
+            line += f"  · worker={task.worker}"
         print(line)
 
 
@@ -399,6 +406,107 @@ def _execute_task(
         prepared.session.close()
 
 
+def _registered_project(root: Path):
+    """按根目录找已注册项目；注册表损坏时提示并返回 None。"""
+    try:
+        registry_data = load_registry()
+    except RegistryError as exc:
+        print(f"warning: 无法读取项目注册表：{exc}", file=sys.stderr)
+        return None
+    resolved = Path(root).resolve()
+    return next(
+        (p for p in registry_data.projects.values() if p.root.resolve() == resolved),
+        None,
+    )
+
+
+def _worker_specs(root: Path):
+    """项目启用的 worker；未注册项目退到默认名册。"""
+    project = _registered_project(root)
+    if project is not None:
+        return roster_for(project)
+    return list(default_workers())
+
+
+def _resolve_worker_slug(root: Path, slug: str) -> str:
+    """校验 worker 名册；非法值抛 WorkerError，调用方明确报错。"""
+    available = {spec.slug for spec in _worker_specs(root)}
+    if slug not in available:
+        raise WorkerError(
+            f"未知或未启用的 worker: {slug!r}；可用: {', '.join(sorted(available))}"
+        )
+    return slug
+
+
+def _execute_task_worker(
+    root: Path,
+    store: TaskStore,
+    task: Task,
+    config: Config,
+    worker_slug: str,
+    *,
+    retry: bool,
+) -> int:
+    """把队列项交给 worker：指派执行或阻塞后重试。"""
+    project = _registered_project(root)
+    if project is None:
+        print(
+            "error: worker 派发需要已注册项目；"
+            f"请先运行 keeper project register {root}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        specs = {spec.slug: spec for spec in roster_for(project)}
+    except WorkerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    spec = specs.get(worker_slug)
+    if spec is None:
+        print(
+            f"error: worker {worker_slug!r} 不在项目 {project.id} 启用的名册里；"
+            f"可用: {', '.join(sorted(specs))}",
+            file=sys.stderr,
+        )
+        return 2
+
+    llm: LLMClient | None = None
+    try:
+        if spec.kind == "built-in":
+            if not config.api_key:
+                print(_api_key_error(), file=sys.stderr)
+                return 2
+            llm = LLMClient(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model,
+                temperature=config.temperature,
+            )
+        record = run_task_worker(
+            project,
+            store,
+            task.id,
+            worker_slug,
+            retry=retry,
+            approver=StdioApprover(timeout=config.approval_timeout),
+            llm=llm,
+            max_steps=config.max_steps,
+        )
+        print(
+            f"task {task.id} · worker={record.worker} · result={record.result}"
+        )
+        print(f"summary: {_short(record.summary, 300)}")
+        if record.transcript:
+            print(f"transcript: {record.transcript}")
+        return 0
+    except (TaskRunError, TaskStoreError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if llm is not None:
+            llm.close()
+
+
 def _task_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="keeper task", description="持久任务队列（M3）")
     common = argparse.ArgumentParser(add_help=False)
@@ -414,6 +522,7 @@ def _task_main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     add_parser = sub.add_parser("add", parents=[common], help="入队一个任务")
     add_parser.add_argument("title", nargs="+", help="任务标题")
+    add_parser.add_argument("--worker", help="指派 worker（须在项目名册里）")
     sub.add_parser("list", parents=[common], help="列出任务")
     run_parser = sub.add_parser("run", parents=[common], help="运行队首或指定任务")
     run_parser.add_argument("id", nargs="?", help="任务 id；省略则跑队首 queued 任务")
@@ -422,6 +531,11 @@ def _task_main(argv: list[str]) -> int:
         action="store_true",
         help="本次 attempt 结束后不自动整理项目记忆",
     )
+    retry_parser = sub.add_parser(
+        "retry", parents=[common], help="重跑阻塞或失败的任务，可换 worker"
+    )
+    retry_parser.add_argument("id", help="任务 id")
+    retry_parser.add_argument("--worker", help="换一个 worker；省略则沿用原指派")
 
     args = parser.parse_args(argv)
 
@@ -435,8 +549,15 @@ def _task_main(argv: list[str]) -> int:
         return 2
 
     if args.command == "add":
+        worker = None
+        if args.worker:
+            try:
+                worker = _resolve_worker_slug(root, args.worker.strip())
+            except WorkerError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
         try:
-            task = store.add(" ".join(args.title))
+            task = store.add(" ".join(args.title), worker=worker)
         except TaskStoreError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -457,16 +578,41 @@ def _task_main(argv: list[str]) -> int:
         _print_task_list(store)
         return 0
 
+    if args.command == "retry":
+        task = store.get(args.id)
+        if task is None:
+            print(f"error: 任务不存在: {args.id}", file=sys.stderr)
+            return 2
+        if task.status != "blocked":
+            print(
+                f"error: 任务 {task.id} 当前状态为 {task.status}；"
+                "只有 blocked（阻塞或失败）可以重试",
+                file=sys.stderr,
+            )
+            return 2
+        worker_slug = args.worker.strip() if args.worker else task.worker
+        if worker_slug is None:
+            project = _registered_project(root)
+            if project is None:
+                print(
+                    "error: 需要 --worker，或先注册项目以使用 default_worker",
+                    file=sys.stderr,
+                )
+                return 2
+            worker_slug = project.default_worker
+        try:
+            worker_slug = _resolve_worker_slug(root, worker_slug)
+        except WorkerError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        config = load_config(model=args.model, max_steps=args.max_steps)
+        return _execute_task_worker(
+            root, store, task, config, worker_slug, retry=True
+        )
+
     # run
     config = load_config(model=args.model, max_steps=args.max_steps)
-    if not config.api_key:
-        print(_api_key_error(), file=sys.stderr)
-        return 2
-
     no_tidy = args.no_tidy
-    _startup_tidy_hint(
-        root, _tidy_enabled(config, no_tidy), config.context_window
-    )
 
     if args.id:
         task = store.get(args.id)
@@ -485,6 +631,19 @@ def _task_main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if task.worker:
+        return _execute_task_worker(
+            root, store, task, config, task.worker, retry=False
+        )
+
+    if not config.api_key:
+        print(_api_key_error(), file=sys.stderr)
+        return 2
+
+    _startup_tidy_hint(
+        root, _tidy_enabled(config, no_tidy), config.context_window
+    )
     return _execute_task(root, store, task, config, no_tidy=no_tidy)
 
 
