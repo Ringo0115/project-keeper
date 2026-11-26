@@ -245,10 +245,17 @@ def _completed_records(task: Task) -> list[CompletionRecord]:
     return records
 
 
-def _since_last_attempt(task: Task) -> str | None:
-    for attempt in reversed(task.attempts):
-        if attempt.ended_at:
-            return attempt.ended_at
+def _since_for_worker(task: Task, worker_slug: str) -> str | None:
+    """recap 起点：同一 worker 续跑只看增量，换 worker 或首次则给整段。
+
+    R5 的原意是「新 worker 首次给整段，之后只补上次派发之后」；since 描述
+    的是该 worker 上次拿到上下文的时间，不是上次 attempt 的结束时间。
+    """
+    if not task.attempts:
+        return None
+    last = task.attempts[-1]
+    if last.ended_at and last.worker == worker_slug:
+        return last.ended_at
     return None
 
 
@@ -267,6 +274,29 @@ def _finish_from_record(
             result=record.result,
             transcript=record.transcript,
         )
+
+
+def _previous_session_path(task: Task, root: Path) -> Path | None:
+    """上一次 attempt 的会话文件；没有可用文件时返回 None（退回最新会话）。
+
+    优先按 attempt.session_id 解析；外部 CLI 的 transcript 可能落在别的
+    目录，只有确实位于本项目 sessions/ 下才采用。任何异常都当作没有。
+    """
+    sessions = Path(root).resolve() / SESSIONS_DIR
+    for attempt in reversed(task.attempts):
+        candidates: list[Path] = []
+        if attempt.session_id:
+            candidates.append(sessions / f"{attempt.session_id}.jsonl")
+        if attempt.transcript:
+            candidates.append(Path(attempt.transcript))
+        for candidate in candidates:
+            try:
+                path = candidate.resolve()
+                if path.parent == sessions and path.is_file():
+                    return path
+            except (OSError, ValueError):
+                continue
+    return None
 
 
 def run_task_worker(
@@ -292,7 +322,8 @@ def run_task_worker(
     if task is None:
         raise TaskRunError(f"任务不存在: {task_id}")
     completed = _completed_records(task)
-    since = _since_last_attempt(task)
+    since = _since_for_worker(task, worker_slug)
+    session_path = _previous_session_path(task, project.root)
     if retry:
         attempt = store.retry_attempt(task_id, worker=worker_slug)
     else:
@@ -309,6 +340,7 @@ def run_task_worker(
         timeout=timeout,
         completed=completed,
         since=since,
+        session_path=session_path,
     )
     if attempt.session_id is None and record.transcript:
         candidate = Path(record.transcript)

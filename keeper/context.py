@@ -84,6 +84,18 @@ def _latest_session(root: Path) -> Path | None:
     return sessions[0].path if sessions else None
 
 
+def _recap_session(root: Path, session_path: Path | None) -> Path | None:
+    """优先用调用方指定的会话；路径不可用时退回最新会话。"""
+    if session_path is not None:
+        try:
+            path = Path(session_path).resolve()
+            if path.is_file():
+                return path
+        except (OSError, ValueError):
+            pass
+    return _latest_session(root)
+
+
 def _recap_lines(path: Path, since_epoch: float | None) -> list[str]:
     """读最近会话，返回 recap 行；坏行与读取失败都退化为“没有”。"""
     summary = ""
@@ -180,8 +192,13 @@ def worker_context(
     *,
     since: str | datetime | int | float | None = None,
     completed: Iterable[CompletionRecord] = (),
+    session_path: Path | None = None,
 ) -> str:
-    """拼装 worker 的完整输入；只读盘，不写任何文件。"""
+    """拼装 worker 的完整输入；只读盘，不写任何文件。
+
+    ``session_path`` 指定 recap 来源会话（交接时传上一次 attempt 的会话）；
+    缺省或不可用时退回项目里最新的会话。
+    """
     root_path = Path(root).resolve()
     since_epoch = _since_epoch(since)
 
@@ -208,12 +225,12 @@ def worker_context(
         inherited.extend(peers)
     parts.append("\n".join(inherited))
 
-    latest = _latest_session(root_path)
-    if latest is not None:
-        recap = _recap_lines(latest, since_epoch)
+    session = _recap_session(root_path, session_path)
+    if session is not None:
+        recap = _recap_lines(session, since_epoch)
         if recap:
             parts.append("## 对话 recap\n\n" + "\n".join(recap))
-        parts.append(f"## 会话日志\n\n完整日志（只读）：{latest}")
+        parts.append(f"## 会话日志\n\n完整日志（只读）：{session}")
 
     parts.append(_render_completed(completed))
     parts.append(_render_brief(brief))

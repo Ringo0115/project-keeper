@@ -309,11 +309,13 @@ def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, 
 
 def _run_one(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, llm: Any,
              max_steps: int, timeout: float, completed: Iterable[CompletionRecord] = (),
-             since: str | int | float | None = None) -> CompletionRecord:
+             since: str | int | float | None = None,
+             session_path: Path | None = None) -> CompletionRecord:
     started = _now(); root = Path(project.root).resolve()
     try:
         from keeper.context import worker_context
-        context = worker_context(root, project, worker, brief, since=since, completed=completed)
+        context = worker_context(root, project, worker, brief, since=since, completed=completed,
+                                 session_path=session_path)
         if worker.kind == "built-in":
             result, reply, transcript, summary = _builtin_dispatch(project, worker, brief, context,
                                                           llm=llm, max_steps=max_steps, timeout=timeout)
@@ -371,7 +373,8 @@ def dispatch_one(project: Project, brief: WorkerBrief, worker: WorkerSpec | str,
                  approver: Any, *, llm: Any = None, max_steps: int = 30,
                  timeout: float = DEFAULT_TIMEOUT,
                  completed: Iterable[CompletionRecord] = (),
-                 since: str | int | float | None = None) -> CompletionRecord:
+                 since: str | int | float | None = None,
+                 session_path: Path | None = None) -> CompletionRecord:
     spec = next((w for w in default_workers() if w.slug == worker), None) if isinstance(worker, str) else worker
     if spec is None: return _record(str(worker), "failed", "未知 worker")
     reason = _approval(project, [(spec, brief)], approver)
@@ -379,7 +382,7 @@ def dispatch_one(project: Project, brief: WorkerBrief, worker: WorkerSpec | str,
     if spec.kind == "built-in" and llm is None:
         return _record(spec.slug, "failed", "built-in worker 缺少 LLM client")
     return _run_one(project, spec, brief, llm=llm, max_steps=max_steps, timeout=timeout,
-                    completed=completed, since=since)
+                    completed=completed, since=since, session_path=session_path)
 
 
 def dispatch_fanout(project: Project, briefs: Iterable[WorkerBrief], workers: Iterable[WorkerSpec | str],

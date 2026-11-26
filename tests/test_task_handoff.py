@@ -236,6 +236,8 @@ def test_retry_recap_only_includes_messages_after_last_attempt(
     )
     task = store.get(task_id)
     task.attempts[-1].ended_at = ended
+    # 同一个 worker 再来一次：只补上次结束之后的增量。
+    task.attempts[-1].worker = "codex"
     store.save()
 
     sessions = tmp_path / SESSIONS_DIR
@@ -262,6 +264,81 @@ def test_retry_recap_only_includes_messages_after_last_attempt(
     context = seen.read_text(encoding="utf-8")
     assert "NEW-AFTER" in context
     assert "OLD-BEFORE" not in context
+
+
+def test_retry_recap_uses_last_attempt_session_not_latest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = TaskStore.load(tmp_path)
+    task_id = _block(store, "继续")
+    ended = datetime.fromtimestamp(time.time() - 500).astimezone().isoformat(
+        timespec="seconds"
+    )
+    task = store.get(task_id)
+    task.attempts[-1].ended_at = ended
+    store.save()
+
+    sessions = tmp_path / SESSIONS_DIR
+    sessions.mkdir(parents=True, exist_ok=True)
+    # 消息时间早于上次 attempt 的 ended_at；换 worker 时仍必须给整段。
+    old_ts = datetime.fromtimestamp(time.time() - 1000).timestamp()
+
+    def write_session(session_id: str, text: str) -> None:
+        records = [
+            {"type": "meta", "version": 1, "session_id": session_id, "created_at": ended},
+            {"type": "message", "ts": old_ts, "message": {"role": "user", "content": text}},
+        ]
+        (sessions / f"{session_id}.jsonl").write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n",
+            encoding="utf-8",
+        )
+
+    # 上次 attempt 挂在 sess-a（另一个 worker）；项目里最新会话是 sess-b。
+    write_session("sess-a", "PROGRESS-IN-A")
+    write_session("sess-b", "PROGRESS-IN-B")
+    task = store.get(task_id)
+    task.attempts[-1].session_id = "sess-a"
+    task.attempts[-1].worker = "built-in"
+    store.save()
+
+    seen = tmp_path / "seen-recap.txt"
+    codex(
+        monkeypatch,
+        f"import sys; open({str(seen)!r}, 'w', encoding='utf-8').write(sys.stdin.read()); print('ok')",
+    )
+    run_task_worker(project(tmp_path), store, task_id, "codex", retry=True, approver=Approver())
+
+    context = seen.read_text(encoding="utf-8")
+    assert "PROGRESS-IN-A" in context
+    assert "PROGRESS-IN-B" not in context
+
+
+def test_first_dispatch_recap_includes_whole_latest_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = TaskStore.load(tmp_path)
+    task = store.add("首次派发")
+
+    sessions = tmp_path / SESSIONS_DIR
+    sessions.mkdir(parents=True, exist_ok=True)
+    old_ts = datetime.fromtimestamp(time.time() - 1000).timestamp()
+    records = [
+        {"type": "meta", "version": 1, "session_id": "s-first", "created_at": "2026-01-01T00:00:00+08:00"},
+        {"type": "message", "ts": old_ts, "message": {"role": "user", "content": "FIRST-CONTEXT"}},
+    ]
+    (sessions / "s-first.jsonl").write_text(
+        "\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n",
+        encoding="utf-8",
+    )
+
+    seen = tmp_path / "seen-first.txt"
+    codex(
+        monkeypatch,
+        f"import sys; open({str(seen)!r}, 'w', encoding='utf-8').write(sys.stdin.read()); print('ok')",
+    )
+    run_task_worker(project(tmp_path), store, task.id, "codex", retry=False, approver=Approver())
+
+    assert "FIRST-CONTEXT" in seen.read_text(encoding="utf-8")
 
 
 def test_cli_add_worker_validates_roster(tmp_path: Path, capsys) -> None:
