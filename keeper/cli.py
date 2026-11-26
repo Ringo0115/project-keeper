@@ -48,6 +48,7 @@ from keeper.task_runner import (
     run_task_worker,
 )
 from keeper.tasks import Task, TaskStore, TaskStoreError
+from keeper.task_lock import TaskLock
 from keeper.tidy import (
     check_due,
     format_check,
@@ -1068,6 +1069,31 @@ def main(argv: list[str] | None = None) -> int:
             return 130
 
     if raw and raw[0] == "task":
+        lock = None
+        task_args = raw[1:]
+        if task_args and task_args[0] in {"add", "run", "retry"}:
+            root_arg = None
+            for index, value in enumerate(task_args):
+                if value == "--root" and index + 1 < len(task_args):
+                    root_arg = Path(task_args[index + 1])
+                    break
+                if value.startswith("--root="):
+                    root_arg = Path(value.split("=", 1)[1])
+                    break
+            lock = TaskLock(_resolve_root(root_arg))
+            try:
+                acquired = lock.acquire()
+            except OSError as exc:
+                print(f"error: 无法创建任务锁 {lock.path}: {exc}", file=sys.stderr)
+                return 2
+            if not acquired:
+                owner = lock._read() or {}
+                pid = owner.get("pid", "未知")
+                print(
+                    f"error: 该项目任务队列正在由 pid {pid} 使用；锁文件: {lock.path}",
+                    file=sys.stderr,
+                )
+                return 2
         try:
             return _task_main(raw[1:])
         except KeyboardInterrupt:
@@ -1079,6 +1105,9 @@ def main(argv: list[str] | None = None) -> int:
         except TaskStoreError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        finally:
+            if lock is not None:
+                lock.release()
 
     try:
         return _chat_main(raw)
