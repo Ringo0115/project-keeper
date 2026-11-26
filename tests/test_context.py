@@ -131,6 +131,59 @@ def test_full_recap_and_session_log(tmp_path: Path) -> None:
     assert str(path.resolve()) in text
 
 
+def test_recap_includes_tool_calls_and_results_with_limits(tmp_path: Path) -> None:
+    long_args = "a" * 400
+    long_output = "E" * 900
+    _write_session(
+        tmp_path,
+        [
+            {
+                "type": "message",
+                "ts": 1000.0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": json.dumps({"argv": [long_args]}),
+                            },
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "ts": 1001.0,
+                "message": {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": long_output,
+                },
+            },
+        ],
+    )
+
+    text = worker_context(tmp_path, _project(tmp_path), _worker(), _brief())
+    assert "assistant 调用 shell" in text
+    assert "tool(shell)" in text
+    # 参数上限 200、结果上限 500（含省略号）：原文不能整段出现。
+    assert long_args not in text
+    assert long_output not in text
+    assert "E" * 499 in text
+    assert "E" * 500 not in text
+
+    # 工具消息与对话消息共用同一个 since 过滤。
+    filtered = worker_context(
+        tmp_path, _project(tmp_path), _worker(), _brief(), since=1500.0
+    )
+    assert "assistant 调用 shell" not in filtered
+    assert "tool(shell)" not in filtered
+
+
 @pytest.mark.parametrize(
     "since", [1500.0, "1970-01-01T00:25:00+00:00"]
 )

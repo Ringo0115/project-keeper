@@ -27,13 +27,14 @@ class CompleteTaskTool(Tool):
     }
     danger: ClassVar[str] = "task"
 
-    def __init__(self, store: TaskStore, task_id: str) -> None:
+    def __init__(self, store: TaskStore, task_id: str, *, transcript: str | None = None) -> None:
         self.store = store
         self.task_id = task_id
+        self.transcript = transcript
 
     def execute(self, args: dict[str, Any]) -> ToolResult:
         try:
-            self.store.complete(self.task_id)
+            self.store.complete(self.task_id, transcript=self.transcript)
         except TaskStoreError as exc:
             return error(str(exc))
         except Exception as exc:  # 兜底：工具 bug 不能弄死 loop
@@ -59,16 +60,17 @@ class BlockTaskTool(Tool):
     }
     danger: ClassVar[str] = "task"
 
-    def __init__(self, store: TaskStore, task_id: str) -> None:
+    def __init__(self, store: TaskStore, task_id: str, *, transcript: str | None = None) -> None:
         self.store = store
         self.task_id = task_id
+        self.transcript = transcript
 
     def execute(self, args: dict[str, Any]) -> ToolResult:
         reason = args.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             return error("block_task 需要非空 reason；任务状态未改变")
         try:
-            self.store.block(self.task_id, reason)
+            self.store.block(self.task_id, reason, transcript=self.transcript)
         except TaskStoreError as exc:
             return error(str(exc))
         except Exception as exc:  # 兜底：工具 bug 不能弄死 loop

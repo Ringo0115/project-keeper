@@ -314,6 +314,23 @@ def test_plain_final_is_incomplete_then_explicit_complete(tmp_path: Path) -> Non
     )
 
 
+def test_manager_run_records_transcript_session_path(tmp_path: Path) -> None:
+    store = TaskStore.load(tmp_path)
+    task = store.add("管理者完成")
+
+    prepared, _ = _run(
+        store,
+        task.id,
+        tmp_path,
+        [_tool_call("complete_task"), _final("完成了")],
+    )
+
+    attempt = store.get(task.id).attempts[-1]
+    assert attempt.outcome == "done"
+    assert attempt.transcript == str(prepared.session.path)
+    assert Path(attempt.transcript).is_file()
+
+
 # ---------------------------------------------------------------------------
 # 7/8. 空 block reason 拒绝
 # ---------------------------------------------------------------------------

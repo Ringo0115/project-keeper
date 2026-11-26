@@ -131,10 +131,12 @@ def run_task_once(
         raise TaskRunError(f"任务不存在: {prepared.task_id}")
 
     tools = [registry.get(name) for name in registry.names()]
+    # 管理者自己跑完时也留下日志路径，供下一次交接引用（只引用，不复制）。
+    transcript = str(prepared.session.path)
     tools.extend(
         [
-            CompleteTaskTool(store, task.id),
-            BlockTaskTool(store, task.id),
+            CompleteTaskTool(store, task.id, transcript=transcript),
+            BlockTaskTool(store, task.id, transcript=transcript),
         ]
     )
     run_registry = Registry(tools)  # type: ignore[arg-type]
