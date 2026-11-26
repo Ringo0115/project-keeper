@@ -31,6 +31,13 @@ from keeper.events import (
 )
 from keeper.llm import LLMClient
 from keeper.loop import AgentLoop
+from keeper.projects import (
+    RegistryError,
+    current_project,
+    load_registry,
+    register_project,
+    use_project,
+)
 from keeper.session import Session
 from keeper.task_runner import TaskRunError, prepare_task_run, run_task_once
 from keeper.tasks import Task, TaskStore, TaskStoreError
@@ -109,6 +116,40 @@ def render(events: Iterable[Event]) -> None:
             if event.detail:
                 line += f" · {event.detail}"
             print(line, file=sys.stderr)
+
+
+def _resolve_root(explicit: Path | None) -> Path:
+    """--root 优先；否则已选项目根目录；再否则当前目录。
+
+    显式 --root 与已选项目不同时只提示，不静默改写：数据仍只写入实际
+    使用的根目录。注册表损坏时回退当前目录并提示，不覆盖原文件。
+    """
+    if explicit is not None:
+        root = explicit.expanduser().resolve()
+        try:
+            selected = current_project()
+        except RegistryError:
+            selected = None
+        if selected is not None and selected.root != root:
+            print(
+                f"note: --root {root} 覆盖已选项目 {selected.id}"
+                f"（{selected.root}）；数据只写入 --root",
+                file=sys.stderr,
+            )
+        return root
+
+    try:
+        selected = current_project()
+    except RegistryError as exc:
+        cwd = Path.cwd().resolve()
+        print(
+            f"warning: {exc}；回退到当前目录 {cwd}",
+            file=sys.stderr,
+        )
+        return cwd
+    if selected is not None:
+        return selected.root
+    return Path.cwd().resolve()
 
 
 def _build_registry(root: Path) -> Registry:
@@ -309,7 +350,10 @@ def _task_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="keeper task", description="持久任务队列（M3）")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录"
+        "--root",
+        type=Path,
+        default=None,
+        help="项目根目录；默认已选项目，否则当前目录",
     )
     common.add_argument("--model", help="覆盖模型名")
     common.add_argument("--max-steps", type=int, help="单个任务的最大步数")
@@ -328,7 +372,7 @@ def _task_main(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
 
-    root = args.root.expanduser().resolve()
+    root = _resolve_root(args.root)
     if not root.is_dir():
         print(f"error: root is not a directory: {root}", file=sys.stderr)
         return 2
@@ -392,6 +436,88 @@ def _task_main(argv: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# M6 R1 项目注册表
+# ---------------------------------------------------------------------------
+
+
+def _project_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="keeper project", description="项目注册表与项目选择（M6 R1）"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add_parser = sub.add_parser("register", help="注册一个项目工作区")
+    add_parser.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        default=Path.cwd(),
+        help="项目根目录，默认当前目录",
+    )
+    add_parser.add_argument("--id", dest="project_id", help="项目 id，默认由目录名生成")
+    add_parser.add_argument("--name", help="显示名，默认用 id")
+    add_parser.add_argument(
+        "--worker", action="append", dest="workers", help="启用的 worker，可重复"
+    )
+    add_parser.add_argument("--default-worker", help="默认 worker")
+    add_parser.add_argument("--instructions", default="", help="项目级部署指令")
+
+    sub.add_parser("list", help="列出已注册项目")
+    show_parser = sub.add_parser("show", help="查看一个项目")
+    show_parser.add_argument("id")
+    use_parser = sub.add_parser("use", help="选择当前项目")
+    use_parser.add_argument("id")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "register":
+            project = register_project(
+                args.path,
+                project_id=args.project_id,
+                name=args.name,
+                workers=tuple(args.workers) if args.workers else None,
+                default_worker=args.default_worker,
+                instructions=args.instructions,
+            )
+            print(f"registered {project.id}  {project.name}  {project.root}")
+            return 0
+
+        if args.command == "list":
+            registry = load_registry()
+            if not registry.projects:
+                print("(no projects)")
+                return 0
+            for pid in sorted(registry.projects):
+                project = registry.projects[pid]
+                mark = "*" if registry.current == pid else " "
+                print(
+                    f"{mark} {project.id}  {project.name}  {project.root}"
+                    f"  workers={','.join(project.workers)}"
+                    f"  default={project.default_worker}"
+                )
+            return 0
+
+        if args.command == "show":
+            project = load_registry().projects.get(args.id)
+            if project is None:
+                raise RegistryError(f"未注册的项目: {args.id}")
+            print(f"id: {project.id}")
+            print(f"name: {project.name}")
+            print(f"root: {project.root}")
+            print(f"workers: {', '.join(project.workers)}")
+            print(f"default_worker: {project.default_worker}")
+            print(f"instructions: {project.instructions}")
+            return 0
+
+        project = use_project(args.id)
+        print(f"current project: {project.id}  {project.root}")
+        return 0
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+# ---------------------------------------------------------------------------
 # M5 记忆治理
 # ---------------------------------------------------------------------------
 
@@ -402,7 +528,10 @@ def _memory_main(argv: list[str]) -> int:
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录"
+        "--root",
+        type=Path,
+        default=None,
+        help="项目根目录；默认已选项目，否则当前目录",
     )
     common.add_argument("--model", help="覆盖模型名")
 
@@ -416,7 +545,7 @@ def _memory_main(argv: list[str]) -> int:
         help="只读查看 due / 预算 / 上次报告，不整理",
     )
     args = parser.parse_args(argv)
-    root = args.root.expanduser().resolve()
+    root = _resolve_root(args.root)
     if not root.is_dir():
         print(f"error: root is not a directory: {root}", file=sys.stderr)
         return 2
@@ -543,7 +672,12 @@ def _maybe_auto_tidy(
 def _chat_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="keeper", description="项目级持久化 Agent（M2）")
     parser.add_argument("task", nargs="*", help="要执行的任务；省略则进入交互模式")
-    parser.add_argument("--root", type=Path, default=Path.cwd(), help="项目根目录，默认当前目录")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="项目根目录；默认已选项目，否则当前目录",
+    )
     parser.add_argument("--resume", action="store_true", help="续跑这个项目最近一次会话")
     parser.add_argument("--session", type=Path, help="加载指定会话文件")
     parser.add_argument("--model", help="覆盖模型名")
@@ -556,7 +690,7 @@ def _chat_main(argv: list[str]) -> int:
     parser.add_argument("--version", action="version", version=f"keeper {__version__}")
     args = parser.parse_args(argv)
 
-    root = args.root.expanduser().resolve()
+    root = _resolve_root(args.root)
     if not root.is_dir():
         print(f"error: root is not a directory: {root}", file=sys.stderr)
         return 2
@@ -654,6 +788,13 @@ def _chat_main(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     _setup_console()
     raw = list(sys.argv[1:] if argv is None else argv)
+
+    if raw and raw[0] == "project":
+        try:
+            return _project_main(raw[1:])
+        except KeyboardInterrupt:
+            print("\ninterrupted.", file=sys.stderr)
+            return 130
 
     if raw and raw[0] == "memory":
         try:
