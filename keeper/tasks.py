@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from keeper.atomic_write import atomic_write_text
 from keeper.file_lock import FileLock
 
 TASKS_FILE = Path(".agent") / "tasks.json"
@@ -297,18 +298,9 @@ class TaskStore:
     def save(self) -> None:
         data = {"version": VERSION, "tasks": [task.to_dict() for task in self.tasks]}
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
         try:
-            with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-                fh.write(payload)
-                fh.flush()
-            os.replace(tmp, self.path)
+            atomic_write_text(self.path, payload)
         except Exception as exc:  # 原子写失败：原文件保持不动
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             raise TaskStoreError(
                 f"无法写入 {self.path}: {type(exc).__name__}: {exc}"
             ) from exc

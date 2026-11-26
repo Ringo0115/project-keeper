@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+from keeper.atomic_write import atomic_write_text
 
 FANOUT_DIR = Path(".agent") / "fanout"
 VERSION = 1
@@ -167,13 +168,4 @@ class FanoutBatch:
     def _write(self) -> None:
         with self._lock:
             payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n"
-            path = self.path
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # 同进程多线程会同时写：pid 之外再加线程 id 和随机后缀，避免临时文件撞车。
-            unique = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
-            tmp = path.with_name(f"{path.name}.tmp.{unique}")
-            with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
+            atomic_write_text(self.path, payload)
