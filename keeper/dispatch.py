@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -174,11 +175,22 @@ def _cli_argv(slug: str, task: str) -> list[str]:
         value = json.loads(raw)
         if not isinstance(value, list) or not value or not all(isinstance(x, str) for x in value):
             raise ValueError(f"{key} must be a non-empty JSON argv array")
-        return [x.replace("{input}", task) for x in value]
-    template = _CLI_DEFAULTS.get(slug)
-    if template is None:
-        raise ValueError(f"没有 {slug} 的 CLI argv 模板")
-    return [part.replace("{input}", task) for part in template]
+        argv = [x.replace("{input}", task) for x in value]
+    else:
+        template = _CLI_DEFAULTS.get(slug)
+        if template is None:
+            raise ValueError(f"没有 {slug} 的 CLI argv 模板")
+        argv = [part.replace("{input}", task) for part in template]
+    # Windows 上 npm 装的是 .CMD 垫片，CreateProcess 只补 .exe 不补 .CMD；
+    # 用 which() 解析成真实可执行文件路径，shell=False 才能直接启动。
+    name = argv[0]
+    resolved = shutil.which(name)
+    if resolved is None:
+        looks_like_path = Path(name).is_absolute() or os.sep in name or bool(os.altsep and os.altsep in name)
+        hint = "" if looks_like_path else f"；可用环境变量 {key} 覆盖"
+        raise ValueError(f"{name} 不存在或不是可执行文件{hint}")
+    argv[0] = resolved
+    return argv
 
 
 def _safe_target(root: Path, raw: str) -> Path:

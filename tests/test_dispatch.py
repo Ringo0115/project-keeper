@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from keeper.context import WorkerBrief
-from keeper.dispatch import ScopedWriteTool, _worker_registry, dispatch_fanout, dispatch_one
+from keeper.dispatch import ScopedWriteTool, _cli_argv, _worker_registry, dispatch_fanout, dispatch_one
 from keeper.projects import Project
 from keeper.tools.dispatch import manager_dispatch_tools
 from keeper.workers import worker_memory_path
@@ -120,6 +121,27 @@ def test_fanout_failure_does_not_cancel_sibling(tmp_path, monkeypatch):
     records = dispatch_fanout(project(tmp_path), [WorkerBrief("bad","x"),WorkerBrief("ok","x")],
                               ["codex","pi"], Approver())
     assert [r.result for r in records] == ["failed", "done"]
+
+
+def test_cli_argv_resolves_existing_executable(monkeypatch):
+    monkeypatch.setenv("KEEPER_WORKER_CODEX_ARGV", json.dumps([sys.executable, "-c", "print(1)", "{input}"]))
+    argv = _cli_argv("codex", "hello")
+    assert argv[0] == shutil.which(sys.executable) and Path(argv[0]).is_file()
+    assert argv[1:] == ["-c", "print(1)", "hello"]
+
+
+def test_cli_argv_rejects_missing_executable(monkeypatch):
+    monkeypatch.setenv("KEEPER_WORKER_CODEX_ARGV", json.dumps(["keeper-no-such-cli-xyz", "{input}"]))
+    with pytest.raises(ValueError) as exc:
+        _cli_argv("codex", "hello")
+    assert "keeper-no-such-cli-xyz" in str(exc.value)
+    assert "KEEPER_WORKER_CODEX_ARGV" in str(exc.value)
+
+
+def test_cli_argv_resolves_env_argv0(monkeypatch):
+    monkeypatch.setenv("KEEPER_WORKER_PI_ARGV", json.dumps([sys.executable, "{input}"]))
+    argv = _cli_argv("pi", "task text")
+    assert argv == [shutil.which(sys.executable), "task text"]
 
 
 def test_builtin_registry_and_manager_only_dispatch_tools(tmp_path):
