@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -428,9 +429,11 @@ async def _claude_sdk_run(argv: list[str], context: str, root: Path,
         _register_sdk_pid(pid)
         registered = True
 
+        # 流式输出按块累积在外层，超时时才能把已收到的文本随异常带出去。
+        parts: list[str] = []
+
         async def collect() -> tuple[str, int]:
             await client.query(context)
-            parts: list[str] = []
             return_code = 0
             async for message in client.receive_response():
                 if getattr(message, "is_error", False):
@@ -452,7 +455,8 @@ async def _claude_sdk_run(argv: list[str], context: str, root: Path,
             except Exception as disconnect_exc:
                 logger.warning("Claude SDK disconnect after timeout failed: %s", disconnect_exc)
             disconnected = True
-            raise subprocess.TimeoutExpired(argv, timeout) from exc
+            # 带上超时前已收到的 assistant 文本，上层 transcript 才不会丢输出。
+            raise subprocess.TimeoutExpired(argv, timeout, output="\n".join(parts)) from exc
         return output, "", return_code
     finally:
         if registered and pid is not None:
@@ -483,6 +487,57 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             proc.kill()
         except Exception:
             pass
+
+
+def _read_text(path: str) -> str:
+    """读回临时输出文件；文件不存在（极少见）按空输出处理。"""
+    try:
+        # newline=None 复现 text=True 的通用换行翻译，reply 语义不变。
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _run_cli(argv: list[str], context: str, root: Path, timeout: float) -> tuple[str, str, int]:
+    """跑外部 CLI，stdout/stderr 各自落临时文件，返回 (stdout, stderr, 退出码)。
+
+    照 Orbital ``proc_runner``：``communicate(timeout=)`` 超时时异常里的
+    stdout/stderr 通常是空的，worker 已经产生的输出会丢；把子进程输出直接
+    指向文件，超时杀树后仍能从文件读回已写出的部分。stdin 必须保持管道：
+    brief 是经 stdin 递给 CLI 的，两个文件也不能合并，stderr 是失败摘要的来源。
+    超时抛出带 output 的 ``TimeoutExpired``，交给上层统一写 transcript。
+    """
+    out_fd, out_name = tempfile.mkstemp(prefix="keeper-stdout-", suffix=".log")
+    err_fd, err_name = tempfile.mkstemp(prefix="keeper-stderr-", suffix=".log")
+    try:
+        timed_out: subprocess.TimeoutExpired | None = None
+        with os.fdopen(out_fd, "w", encoding="utf-8", errors="replace") as out_file, \
+                os.fdopen(err_fd, "w", encoding="utf-8", errors="replace") as err_file:
+            proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=out_file,
+                                    stderr=err_file, text=True, encoding="utf-8",
+                                    errors="replace", shell=False)
+            _register_live(proc)
+            try:
+                proc.communicate(input=context, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                _kill_tree(proc)
+                timed_out = exc
+            except KeyboardInterrupt:
+                _kill_tree(proc)
+                raise
+            finally:
+                _unregister_live(proc)
+        stdout, stderr_text = _read_text(out_name), _read_text(err_name)
+        if timed_out is not None:
+            raise subprocess.TimeoutExpired(argv, timeout, output=stdout,
+                                            stderr=stderr_text) from timed_out
+        return stdout, stderr_text, proc.returncode
+    finally:
+        for name in (out_name, err_name):
+            try:
+                os.remove(name)
+            except OSError:
+                pass
 
 
 def _builtin_dispatch(project: Project, worker: WorkerSpec, brief: WorkerBrief, context: str,
@@ -533,38 +588,15 @@ def _run_one_inner(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, 
         transcript_path = _transcript_path(root, worker.slug)
         argv = _cli_argv(worker.slug, context)
         try:
-            proc: subprocess.Popen | None = None
             if worker.slug == "claude-code":
                 try:
                     stdout, stderr_text, return_code = asyncio.run(
                         _claude_sdk_run(argv, context, root, timeout))
                 except _SDKUnavailable as exc:
                     logger.warning("Claude SDK unavailable before dispatch; falling back to Popen: %s", exc)
-                    proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                                            errors="replace", shell=False)
-                    _register_live(proc)
-                    try:
-                        out, err = proc.communicate(input=context, timeout=timeout)
-                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                        _kill_tree(proc)
-                        raise
-                    finally:
-                        _unregister_live(proc)
-                    stdout, stderr_text, return_code = out or "", err or "", proc.returncode
+                    stdout, stderr_text, return_code = _run_cli(argv, context, root, timeout)
             else:
-                proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                                        errors="replace", shell=False)
-                _register_live(proc)
-                try:
-                    out, err = proc.communicate(input=context, timeout=timeout)
-                except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                    _kill_tree(proc)
-                    raise
-                finally:
-                    _unregister_live(proc)
-                stdout, stderr_text, return_code = out or "", err or "", proc.returncode
+                stdout, stderr_text, return_code = _run_cli(argv, context, root, timeout)
             reply = stdout.strip()
             stderr = stderr_text.strip()[:2000]
             with transcript_path.open("w", encoding="utf-8") as fh:

@@ -84,6 +84,21 @@ def test_cli_timeout_interrupted(tmp_path, monkeypatch):
     assert record.result == "interrupted" and "超时" in record.summary and Path(record.transcript).is_file()
 
 
+def test_cli_timeout_keeps_already_printed_output(tmp_path, monkeypatch):
+    # 先打印再睡死：超时杀树后，文件里已写出的 stdout/stderr 必须留在 transcript。
+    code = ("import sys, time; print('TIMEOUT-STDOUT-MARKER', flush=True); "
+            "print('TIMEOUT-STDERR-MARKER', file=sys.stderr, flush=True); time.sleep(5)")
+    codex(monkeypatch, code)
+    record = dispatch_one(project(tmp_path), WorkerBrief("slow", "do"), "codex", Approver(), timeout=1.0)
+    assert record.result == "interrupted" and "超时" in record.summary
+    assert "TIMEOUT-STDOUT-MARKER" in record.reply
+    transcript = Path(record.transcript).read_text(encoding="utf-8")
+    stdout_at = transcript.index("TIMEOUT-STDOUT-MARKER")
+    stderr_marker_at = transcript.index("TIMEOUT-STDERR-MARKER")
+    # stdout 落在 STDOUT 段、stderr 落在 STDERR 段——两个文件不能被合并。
+    assert transcript.index("STDOUT:") < stdout_at < transcript.index("STDERR:") < stderr_marker_at
+
+
 def test_external_worker_memory_violation_restores_and_fails(tmp_path, monkeypatch):
     target = tmp_path / ".agent" / "memory" / "DECISIONS.md"
     target.parent.mkdir(parents=True)
@@ -175,7 +190,11 @@ def _install_fake_claude_sdk(monkeypatch, *, pid=12345, slow=False):
 
         async def receive_response(self):
             if slow:
+                # 先吐一块文本再睡死：超时前已收到的内容必须能被带出去。
+                yield types.SimpleNamespace(
+                    content=[types.SimpleNamespace(text="sdk partial")], is_error=False)
                 await asyncio.sleep(1)
+                return
             yield types.SimpleNamespace(content=[types.SimpleNamespace(text="sdk reply")], is_error=False)
 
         async def disconnect(self):
@@ -239,6 +258,17 @@ def test_claude_sdk_timeout_kills_before_disconnect(tmp_path, monkeypatch):
     record = dispatch_one(project(tmp_path), WorkerBrief("timeout", "do"), "claude-code", Approver(), timeout=.01)
     assert record.result == "interrupted" and "0.01s" in record.summary
     assert events.index("kill") < events.index("disconnect")
+
+
+def test_claude_sdk_timeout_keeps_partial_text_in_transcript(tmp_path, monkeypatch):
+    _install_fake_claude_sdk(monkeypatch, slow=True)
+    monkeypatch.setenv("KEEPER_WORKER_CLAUDE_CODE_ARGV", json.dumps([sys.executable, "{input}"]))
+    monkeypatch.setattr("keeper.dispatch._kill_sdk_pid", lambda _pid: None)
+    record = dispatch_one(project(tmp_path), WorkerBrief("timeout", "do"), "claude-code",
+                          Approver(), timeout=.05)
+    assert record.result == "interrupted"
+    assert "sdk partial" in record.reply
+    assert "sdk partial" in Path(record.transcript).read_text(encoding="utf-8")
 
 
 def test_codex_default_template_enables_workspace_write(monkeypatch):
