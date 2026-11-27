@@ -107,7 +107,7 @@ keeper project use api
 
 **交接**：worker 的输入包括四个记忆文件的路径（自己读，不内联正文）、它自己的 `MEMORY.md`、同项目其他 worker 已有的 `MEMORY.md`、对话 recap、会话日志路径、上一轮完成记录和任务说明。换 worker 时这些都交过去，所以不用重讲背景。每个 worker 在 `.agent/sub_agents/<slug>/MEMORY.md` 有自己的工作笔记，跨派发保留；共享记忆是事实源，私有记忆只是笔记。
 
-**怎么算完成**：所有 worker 的输出统一成完成记录（结果、摘要、完整回复、transcript 路径、耗时）。退出码非 0 → 失败并留原因；超时或中断 → 中断；退出码 0 但回复为空不算成功。纯文本不算完成，最终由管理者判定。
+**怎么算完成**：所有 worker 的输出统一成完成记录（结果、摘要、完整回复、transcript 路径、耗时、`verified` 标记）。内置 worker 必须在结束前调用 `submit_result` 提交非空摘要，否则记失败。外部 CLI 退出码非 0、回复为空、或者 `allowed` 非空但可写范围内没有任何改动，都记失败；`allowed` 为空的只读任务允许记 done，但 `verified` 为 false。超时或中断记 interrupted。外部 CLI 违规改动项目记忆文件会被快照还原并记失败。即使记 done，外部 worker 的结论也只是候选结果，最终由管理者核验。
 
 ## 项目记忆
 
@@ -193,12 +193,14 @@ keeper project use api
 
 Web UI、后台常驻服务、OS 级沙箱、向量库 / RAG、外部事件触发器（GitHub / 飞书 / 日历）、递归的内部子 agent（管理者可以派发，worker 不能再派）。
 
+## 已知限制
+
+- **跨终端误判中断**：在另一个终端执行任意 `keeper task` 命令，可能把本终端正在跑的任务误标为中断——没有跨进程的存活检测。
+- **中断重跑不幂等**：worker 在改动落盘前被中断，恢复后会重新执行同一批改动，可能重复修改文件。
+- **fanout 并发交付误判**：并行子任务的 `allowed` 写范围重叠时，交付判定依据的是全工作区前后指纹差，兄弟任务的写入可能把零改动任务误判成 done + verified；keeper 自己的批次记录与兄弟任务日志也可能被误报为越界改动（仅提示级，不会还原）。管理者验收时须自行核对产物归属；单发派发不受此影响。
+
 ## 开发
 
 ```bash
 pytest -q
 ```
-
-## 文档
-
-[需求](docs/REQUIREMENTS.md) · [决策](docs/DECISIONS.md) · [维护](docs/MAINTENANCE.md) · [参考](docs/REFERENCES.md)
