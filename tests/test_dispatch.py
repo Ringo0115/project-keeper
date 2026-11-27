@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import shutil
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -142,6 +144,108 @@ def test_cli_argv_resolves_env_argv0(monkeypatch):
     monkeypatch.setenv("KEEPER_WORKER_PI_ARGV", json.dumps([sys.executable, "{input}"]))
     argv = _cli_argv("pi", "task text")
     assert argv == [shutil.which(sys.executable), "task text"]
+
+
+def _install_fake_claude_sdk(monkeypatch, *, pid=12345, slow=False):
+    module = types.ModuleType("claude_agent_sdk")
+    captured = {}
+    events = []
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class PermissionResultAllow:
+        pass
+
+    class PermissionResultDeny:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeClient:
+        def __init__(self, *, options):
+            captured["client_options"] = options
+            self._transport = types.SimpleNamespace(_process=types.SimpleNamespace(pid=pid))
+
+        async def connect(self):
+            events.append("connect")
+
+        async def query(self, prompt):
+            captured["prompt"] = prompt
+
+        async def receive_response(self):
+            if slow:
+                await asyncio.sleep(1)
+            yield types.SimpleNamespace(content=[types.SimpleNamespace(text="sdk reply")], is_error=False)
+
+        async def disconnect(self):
+            events.append("disconnect")
+
+    module.ClaudeAgentOptions = ClaudeAgentOptions
+    module.ClaudeSDKClient = FakeClient
+    module.PermissionResultAllow = PermissionResultAllow
+    module.PermissionResultDeny = PermissionResultDeny
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+    monkeypatch.setattr("keeper.claude_sdk.native_claude_cli", lambda _path: r"C:\fake\claude.exe")
+    return captured, events
+
+
+def test_claude_sdk_normal_path_uses_default_permissions_and_native_cli(tmp_path, monkeypatch):
+    captured, _events = _install_fake_claude_sdk(monkeypatch)
+    monkeypatch.setenv("KEEPER_WORKER_CLAUDE_CODE_ARGV", json.dumps([sys.executable, "{input}"]))
+    brief = WorkerBrief("sdk", "do", ("src",))
+    record = dispatch_one(project(tmp_path), brief, "claude-code", Approver())
+    assert record.result == "failed"  # no allowed-scope change was made
+    assert captured["permission_mode"] == "default"
+    assert captured["cli_path"].endswith(".exe") and not captured["cli_path"].endswith(".cmd")
+    assert captured["env"]["CLAUDECODE"] == ""
+    assert captured["prompt"]
+
+
+def test_claude_sdk_missing_pid_falls_back_to_popen(tmp_path, monkeypatch):
+    captured, _events = _install_fake_claude_sdk(monkeypatch)
+    fake_module = sys.modules["claude_agent_sdk"]
+    original_client = fake_module.ClaudeSDKClient
+
+    class NoPidClient(original_client):
+        def __init__(self, *, options):
+            super().__init__(options=options)
+            class BrokenProcess:
+                @property
+                def pid(self):
+                    raise RuntimeError("pid unavailable")
+            self._transport._process = BrokenProcess()
+
+    fake_module.ClaudeSDKClient = NoPidClient
+    code = "from pathlib import Path; Path('src').mkdir(); Path('src/fallback.txt').write_text('ok'); print('popen reply')"
+    monkeypatch.setenv("KEEPER_WORKER_CLAUDE_CODE_ARGV", json.dumps([sys.executable, "-c", code, "{input}"]))
+    record = dispatch_one(project(tmp_path), WorkerBrief("fallback", "do", ("src",)), "claude-code", Approver())
+    assert record.result == "done" and record.verified and record.reply == "popen reply"
+    assert (tmp_path / "src" / "fallback.txt").read_text() == "ok"
+
+
+def test_claude_sdk_import_failure_falls_back_to_popen(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+    code = "from pathlib import Path; Path('src').mkdir(); Path('src/fallback.txt').write_text('ok'); print('popen reply')"
+    monkeypatch.setenv("KEEPER_WORKER_CLAUDE_CODE_ARGV", json.dumps([sys.executable, "-c", code, "{input}"]))
+    record = dispatch_one(project(tmp_path), WorkerBrief("fallback", "do", ("src",)), "claude-code", Approver())
+    assert record.result == "done" and record.verified and record.reply == "popen reply"
+
+
+def test_claude_sdk_timeout_kills_before_disconnect(tmp_path, monkeypatch):
+    _captured, events = _install_fake_claude_sdk(monkeypatch, slow=True)
+    monkeypatch.setenv("KEEPER_WORKER_CLAUDE_CODE_ARGV", json.dumps([sys.executable, "{input}"]))
+    monkeypatch.setattr("keeper.dispatch._kill_sdk_pid", lambda _pid: events.append("kill"))
+    record = dispatch_one(project(tmp_path), WorkerBrief("timeout", "do"), "claude-code", Approver(), timeout=.01)
+    assert record.result == "interrupted" and "0.01s" in record.summary
+    assert events.index("kill") < events.index("disconnect")
+
+
+def test_codex_default_template_enables_workspace_write(monkeypatch):
+    monkeypatch.delenv("KEEPER_WORKER_CODEX_ARGV", raising=False)
+    monkeypatch.setattr("keeper.dispatch.shutil.which", lambda _name: sys.executable)
+    argv = _cli_argv("codex", "x")
+    assert argv[1:] == ["exec", "-", "-s", "workspace-write"]
 
 
 def test_builtin_registry_and_manager_only_dispatch_tools(tmp_path):

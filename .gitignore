@@ -3,6 +3,9 @@
 README.local
 docs/
 CLAUDE.md
+AGENTS.md
+HANDOFF*.local.md
+probe_*.py
 __pycache__/
 *.pyc
 .pytest_cache/

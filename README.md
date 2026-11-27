@@ -101,7 +101,7 @@ keeper project use api
 | `codex` | 外部 CLI | 独立实现与验证代码、修测试 |
 | `pi` | 外部 CLI | 已有 pi 工作流时 |
 
-外部 worker 的默认启动命令是 `claude -p` / `codex exec -` / `pi --print`，任务文本从 stdin 传入。要换命令用 `KEEPER_WORKER_CODEX_ARGV='["codex","exec","-"]'` 这类环境变量，值是 JSON 数组，`{input}` 会被替换成任务文本。
+外部 worker 的启动方式分两种。`claude-code` 走 `claude-agent-sdk`：`permission_mode="default"` 加 `can_use_tool` 回调，工具请求回到 Python 里按 hands-off 放行，CLI 路径由 keeper 换成原生 `claude.exe`（SDK 不接受 npm 的 `.cmd` 垫片）。`codex` 与 `pi` 是命令行模板 `codex exec - -s workspace-write` 与 `pi --print`，任务文本从 stdin 传入。要换命令用 `KEEPER_WORKER_CODEX_ARGV='["codex","exec","-"]'` 这类环境变量，值是 JSON 数组，`{input}` 会被替换成任务文本。
 
 **worker 能写什么**：内置 worker 只拿到只读文件工具和一个受限写工具，只能写任务指定的范围和自己那份 `MEMORY.md`，四个项目记忆文件及其备份、归档一律拦住；也没有 shell 和派发工具。外部 CLI 的真实权限由它自己的配置决定，keeper 的保护是派发前给四个记忆文件拍快照，结束后比对，被改了就还原并把这次记录标成失败，同时保留 transcript。
 

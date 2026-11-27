@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
+import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -26,6 +29,8 @@ from keeper.tools.fs import ListDirTool, ReadFileTool, SearchTool
 from keeper.tools.registry import Registry
 from keeper.workers import WorkerSpec, default_workers, worker_memory_path
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from keeper.context import WorkerBrief
 
@@ -37,7 +42,7 @@ except ValueError:
 _CLI_DEFAULTS = {
     # Defaults only; KEEPER_WORKER_<SLUG>_ARGV JSON array overrides each template.
     "claude-code": ["claude", "-p"],
-    "codex": ["codex", "exec", "-"],
+    "codex": ["codex", "exec", "-", "-s", "workspace-write"],
     "pi": ["pi", "--print"],
 }
 
@@ -309,6 +314,41 @@ def _worker_registry(root: Path, brief: WorkerBrief, slug: str) -> Registry:
 
 _LIVE_LOCK = threading.Lock()
 _LIVE_PROCS: dict[int, subprocess.Popen] = {}
+_LIVE_SDK_PIDS: set[int] = set()
+
+
+class _SDKUnavailable(RuntimeError):
+    """SDK 在任务真正开始前就不可用，此时还能安全退回 CLI 路径。"""
+
+
+def _register_sdk_pid(pid: int) -> None:
+    with _LIVE_LOCK:
+        _LIVE_SDK_PIDS.add(pid)
+
+
+def _unregister_sdk_pid(pid: int) -> None:
+    with _LIVE_LOCK:
+        _LIVE_SDK_PIDS.discard(pid)
+
+
+def _kill_sdk_pid(pid: int) -> None:
+    """SDK 的 disconnect 不会杀子进程，所以按 pid 杀掉整棵进程树。"""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _kill_sdk_pids(pids: Iterable[int]) -> list[int]:
+    killed: list[int] = []
+    for pid in pids:
+        _kill_sdk_pid(pid)
+        killed.append(pid)
+    return killed
 
 
 def _register_live(proc: subprocess.Popen) -> None:
@@ -325,12 +365,103 @@ def kill_live_workers() -> list[int]:
     """杀掉所有仍在运行的 worker 子进程树，返回被杀的 pid 列表。"""
     with _LIVE_LOCK:
         procs = list(_LIVE_PROCS.values())
-    killed: list[int] = []
+        sdk_pids = list(_LIVE_SDK_PIDS)
+    killed = _kill_sdk_pids(sdk_pids)
     for proc in procs:
         if proc.poll() is None:
             _kill_tree(proc)
             killed.append(proc.pid)
     return killed
+
+
+async def _claude_sdk_run(argv: list[str], context: str, root: Path,
+                          timeout: float) -> tuple[str, str, int]:
+    """Run Claude through the SDK; only pre-query setup failures permit fallback."""
+    try:
+        from claude_agent_sdk import (ClaudeAgentOptions, ClaudeSDKClient,
+                                      PermissionResultAllow, PermissionResultDeny)
+        from keeper.claude_sdk import Autonomy, native_claude_cli, should_auto_approve
+    except Exception as exc:
+        raise _SDKUnavailable(f"SDK import failed: {exc}") from exc
+
+    async def can_use_tool(tool_name: str, _tool_input: dict[str, Any], _context: Any) -> Any:
+        if should_auto_approve(tool_name, Autonomy.HANDS_OFF):
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="tool requires approval")
+
+    try:
+        options = ClaudeAgentOptions(
+            cwd=str(root), permission_mode="default", can_use_tool=can_use_tool,
+            cli_path=native_claude_cli(argv[0]) or None,
+            env={**os.environ, "CLAUDECODE": ""},
+            # 照 Orbital（sdk_transport.py:392）：SDK 默认 1 MiB 单行上限，
+            # 一次大文件 Read 回来的 base64 工具结果就能把它撑爆并杀掉 reader。
+            # 16 MiB 是余量，不是许可证。
+            max_buffer_size=16 * 1024 * 1024,
+        )
+        client = ClaudeSDKClient(options=options)
+    except Exception as exc:
+        raise _SDKUnavailable(f"SDK setup failed: {exc}") from exc
+    connected = False
+    registered = False
+    pid: int | None = None
+    disconnected = False
+    try:
+        try:
+            await client.connect()
+        except Exception as exc:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise _SDKUnavailable(f"SDK connect failed: {exc}") from exc
+        connected = True
+        try:
+            pid = int(client._transport._process.pid)
+        except Exception as exc:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            disconnected = True
+            raise _SDKUnavailable(f"SDK process pid unavailable: {exc}") from exc
+        _register_sdk_pid(pid)
+        registered = True
+
+        async def collect() -> tuple[str, int]:
+            await client.query(context)
+            parts: list[str] = []
+            return_code = 0
+            async for message in client.receive_response():
+                if getattr(message, "is_error", False):
+                    return_code = 1
+                for block in getattr(message, "content", ()):
+                    text = getattr(block, "text", None)
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts), return_code
+
+        try:
+            output, return_code = await asyncio.wait_for(collect(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            # Orbital 的 stop 会先 disconnect 再杀树；其边界允许优雅等待。
+            # 这里是超时止血，必须先 taskkill，避免 disconnect 等待期间继续写文件。
+            _kill_sdk_pid(pid)
+            try:
+                await client.disconnect()
+            except Exception as disconnect_exc:
+                logger.warning("Claude SDK disconnect after timeout failed: %s", disconnect_exc)
+            disconnected = True
+            raise subprocess.TimeoutExpired(argv, timeout) from exc
+        return output, "", return_code
+    finally:
+        if registered and pid is not None:
+            _unregister_sdk_pid(pid)
+        if connected and not disconnected:
+            try:
+                await client.disconnect()
+            except Exception as exc:
+                logger.warning("Claude SDK disconnect failed: %s", exc)
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -402,22 +533,38 @@ def _run_one_inner(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, 
         transcript_path = _transcript_path(root, worker.slug)
         argv = _cli_argv(worker.slug, context)
         try:
-            proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                                    errors="replace", shell=False)
-            _register_live(proc)
-            try:
-                out, err = proc.communicate(input=context, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                raise
-            except KeyboardInterrupt:
-                _kill_tree(proc)
-                raise
-            finally:
-                _unregister_live(proc)
-            stdout = out or ""
-            stderr_text = err or ""
+            proc: subprocess.Popen | None = None
+            if worker.slug == "claude-code":
+                try:
+                    stdout, stderr_text, return_code = asyncio.run(
+                        _claude_sdk_run(argv, context, root, timeout))
+                except _SDKUnavailable as exc:
+                    logger.warning("Claude SDK unavailable before dispatch; falling back to Popen: %s", exc)
+                    proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                            errors="replace", shell=False)
+                    _register_live(proc)
+                    try:
+                        out, err = proc.communicate(input=context, timeout=timeout)
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        _kill_tree(proc)
+                        raise
+                    finally:
+                        _unregister_live(proc)
+                    stdout, stderr_text, return_code = out or "", err or "", proc.returncode
+            else:
+                proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                        errors="replace", shell=False)
+                _register_live(proc)
+                try:
+                    out, err = proc.communicate(input=context, timeout=timeout)
+                except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                    _kill_tree(proc)
+                    raise
+                finally:
+                    _unregister_live(proc)
+                stdout, stderr_text, return_code = out or "", err or "", proc.returncode
             reply = stdout.strip()
             stderr = stderr_text.strip()[:2000]
             with transcript_path.open("w", encoding="utf-8") as fh:
@@ -432,8 +579,8 @@ def _run_one_inner(project: Project, worker: WorkerSpec, brief: WorkerBrief, *, 
                                   for rel in set(before_files) | set(after_files)
                                   if _within_allowed(rel, root, brief))
             scope_note = f"；提示：检测到 allowed 范围外改动：{', '.join(outside[:20])}" if outside else ""
-            if proc.returncode != 0:
-                return _record(worker.slug, "failed", f"退出码 {proc.returncode}; stderr: {stderr or '(空)'}{scope_note}", reply, str(transcript_path), started)
+            if return_code != 0:
+                return _record(worker.slug, "failed", f"退出码 {return_code}; stderr: {stderr or '(空)'}{scope_note}", reply, str(transcript_path), started)
             if not reply:
                 return _record(worker.slug, "failed", f"退出码为 0 但回复为空，不能判定成功{scope_note}", "", str(transcript_path), started)
             if brief.allowed and not allowed_changed:
